@@ -1,0 +1,39 @@
+appId: com.vasanthamana.jeeves
+productName: Jeeves
+copyright: Copyright (c) 2026 Vasanth Amana
+
+directories:
+  output: dist
+  buildResources: resources
+
+asar: true
+
+# Native addons (better-sqlite3) cannot be loaded from inside an asar archive.
+asarUnpack:
+  - "**/*.node"
+
+# ═══════════════════════════════════════════════════
+# macOS
+# ═══════════════════════════════════════════════════
+mac:
+  target:
+    - target: dmg
+    - target: zip
+  category: public.app-category.productivity
+
+# ═══════════════════════════════════════════════════
+# Windows
+# ═══════════════════════════════════════════════════
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: "${productName}-Setup-${version}.${ext}"
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Jeeves
