@@ -4,6 +4,7 @@
   "description": "Jeeves — a WhatsApp Web copilot: embeds WhatsApp Web in Electron, reads chats into topic digests with gated draft replies, and self-heals its own DOM-extraction code and UI selectors via an LLM when WhatsApp's markup changes.",
   "main": "./out/main/index.js",
   "scripts": {
+    "postinstall": "electron-builder install-app-deps",
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
