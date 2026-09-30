@@ -224,3 +224,16 @@ test('an outgoing message whose quote never attached is not reported quoted just
   assert.match(r.note ?? '', /couldn’t confirm the quote/)
   assert.deepEqual(page.sent, [])
 })
+
+test('a quoted message longer than 40 characters, cut mid-word for matching, is still confirmed as quoted', async () => {
+  const page = new MimicWhatsApp(chats())
+  const long = { dataId: `false_${SITE}_3A09_${ALICE}`, sender: 'Al', text: 'Kindly confirm the delivery schedules for tomorrow' }
+  page.chats[1].messages.push(long)
+  assert.ok(long.text.slice(0, 40).endsWith('schedules fo'))
+  const plan = planFor({ conversationId: 'site-team', messageId: long.dataId }, [captured('Site Team', long)])
+
+  const r = await stageReply(deps(page), plan)
+
+  assert.equal(page.quote?.dataId, long.dataId)
+  assert.equal(r.quoted, true)
+})

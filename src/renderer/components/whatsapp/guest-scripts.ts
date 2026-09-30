@@ -246,8 +246,8 @@ export function menuItemPoint(label: string): Point | null {
   return null
 }
 
-/** Whether a reply-quote is attached above the composer: any of `expect` shows in the footer as a whole word/phrase, outside the box itself. */
-export function quoteAttached(composerSel: string, expect: string[]): boolean {
+/** Whether a reply-quote is attached above the composer: any of `expect` shows in the footer (names: as a whole word), outside the box itself. */
+export function quoteAttached(composerSel: string, expect: string[], names: string[]): boolean {
   const c = document.querySelector<HTMLElement>(composerSel)
   const footer = (c && c.closest('footer')) || document.querySelector('#main footer')
   if (!footer) return false
@@ -257,7 +257,7 @@ export function quoteAttached(composerSel: string, expect: string[]): boolean {
   const norm = (s: string): string => s.replace(/\s+/g, ' ').trim().toLowerCase()
   const hay = norm(text)
   const word = (e: string): boolean => new RegExp('(?<![\\p{L}\\p{N}])' + e.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?![\\p{L}\\p{N}])', 'u').test(hay)
-  return expect.map(norm).some((e) => e.length > 0 && word(e))
+  return expect.map(norm).some((e) => e.length > 0 && hay.includes(e)) || names.map(norm).some((e) => e.length > 0 && word(e))
 }
 
 /** Type `query` into the chat-list search box (clearing it first). false = no search box. */

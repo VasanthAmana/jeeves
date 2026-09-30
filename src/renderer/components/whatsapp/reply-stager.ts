@@ -101,8 +101,10 @@ export async function quoteMessage(d: StageDeps, plan: WaReplyPlan): Promise<{ q
   d.click(item)
   await d.sleep(QUOTE_WAIT_MS)
   // The quote panel shows the message's text (or, for media, its sender) above the box.
-  const expect = [q.text.slice(0, 40), q.direction === 'outgoing' ? '' : (q.sender ?? '')].filter((t) => t.trim().length >= 3)
-  const quoted = await run(d, 'quoteAttached', false, gs.quoteAttached, d.sels().composer, expect)
+  const long = (t: string): boolean => t.trim().length >= 3
+  const expect = [q.text.slice(0, 40)].filter(long)
+  const names = [q.direction === 'outgoing' ? '' : (q.sender ?? '')].filter(long)
+  const quoted = await run(d, 'quoteAttached', false, gs.quoteAttached, d.sels().composer, expect, names)
   return quoted ? { quoted: true } : { quoted: false, note: 'Clicked “Reply” on the message, but couldn’t confirm the quote is attached — check it before sending.' }
 }
 
