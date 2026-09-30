@@ -6,18 +6,24 @@ import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { TopicsView } from './topics-view'
 import { registerWaSender, type WaTaskSend } from './wa-sender'
+import { createGuest, type Guest } from './guest'
+import { sweepChats } from './sweep'
+import * as gs from './guest-scripts'
 import type { NormalizedMessage, WaConversationView, WaMessageView, WaSessionState, WaWebviewConfig } from '@shared/ipc-contract'
 
 // The imperative bits of Electron's <webview> we call (the element is an HTMLElement subclass).
+// Scripts never go through executeJavaScript directly — only via guest.ts (see there for why).
 interface WaWebview {
   executeJavaScript(code: string): Promise<unknown>
   // Real trusted input into the guest page — WhatsApp's React ignores synthetic DOM .click(),
   // so the chat-scan sweep drives it with these instead (WAC-004-live sweep).
   sendInputEvent(e: { type: string; x?: number; y?: number; button?: string; clickCount?: number; keyCode?: string; modifiers?: string[] }): void
-  addEventListener(type: string, listener: (e: { message?: string }) => void): void
-  removeEventListener(type: string, listener: (e: { message?: string }) => void): void
+  addEventListener(type: string, listener: (e: WaWebviewEvent) => void): void
+  removeEventListener(type: string, listener: (e: WaWebviewEvent) => void): void
   reload(): void
 }
+// console-message carries `message`; did-start-navigation carries isMainFrame/isInPlace.
+type WaWebviewEvent = { message?: string; isMainFrame?: boolean; isInPlace?: boolean }
 
 // The extraction recipe (WAC-004/019) is no longer hardcoded here — it lives in main as DATA
 // (src/main/whatsapp/recipe.ts), is fetched via wa:getRecipe, and injected into the sandboxed
@@ -223,13 +229,16 @@ export function WhatsAppView(): React.JSX.Element {
 // appears here to link a phone, and stays linked across restarts. On dom-ready we inject the
 // read-only DOM detector; its captured messages arrive as console messages, which we validate
 // in main via wa:ingest. Nothing here ever sends a message.
-// The sweep clicks each VISIBLE chat row to open it, letting the detector read it. Capped +
+// The sweep walks the chat list (scrolling as each screen is used up) and clicks rows to open them,
+// letting the detector read each one (see sweep.ts). Capped +
 // opt-in because opening a chat marks it read and sends a read receipt (a real side effect).
 const SWEEP_MAX = 12
 const SWEEP_DELAY_MS = 1700
 
 function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element {
   const ref = useRef<HTMLElement>(null)
+  // The guest-script runner for this webview (created on mount; shared with the sweep).
+  const guest = useRef<Guest | null>(null)
   const [loaded, setLoaded] = useState(false)
   const [sweep, setSweep] = useState<{ running: boolean; done: number; total: number; current?: string }>({ running: false, done: 0, total: 0 })
   const [heal, setHeal] = useState<'ok' | 'healing' | 'healed' | 'failed'>('ok')
@@ -252,26 +261,31 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
   useEffect(() => {
     const wv = ref.current as unknown as WaWebview | null
     if (!wv) return
+    const g = createGuest(wv)
+    guest.current = g
 
     // Inject a recipe (data) into the sandboxed guest page. Clears the guard so a re-inject runs;
-    // enables the WAC-019 internal-store read (all chats, no read receipts).
-    const inject = async (recipe: string): Promise<void> => {
-      try {
-        await wv.executeJavaScript('window.__waCopilot=false; window.__WA_STORE_READ=true; window.__WA_AUDIO_READ=true;')
-        await wv.executeJavaScript(recipe)
-      } catch {
-        /* injection failed — page not ready */
-      }
+    // enables the WAC-019 internal-store read (all chats, no read receipts). false = it didn't run
+    // (page not ready, or the recipe threw — the guest's error is logged by the runner).
+    const inject = async (recipe: string): Promise<boolean> => {
+      if (!(await g.run('armRecipe', gs.armRecipe)).ok) return false
+      return (await g.runData('recipe', recipe)).ok
     }
 
     const onDom = async (): Promise<void> => {
+      g.setReady(true)
       setLoaded(true)
       try {
         const { recipe } = await invoke('wa:getRecipe')
         await inject(recipe)
-      } catch {
-        /* ignore */
+      } catch (e) {
+        console.warn('[wa-guest] recipe fetch failed:', e)
       }
+    }
+    // A main-frame navigation (reload, WhatsApp's own redirects) tears down the page: stop calling
+    // into it until the next dom-ready rather than racing a half-loaded document.
+    const onNavStart = (e: WaWebviewEvent): void => {
+      if (e.isMainFrame && !e.isInPlace) g.setReady(false)
     }
 
     // Load the healable action selectors (may already carry earlier heals).
@@ -286,12 +300,10 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
     // snapshot (tags/roles/data-icon/aria — never message text) and let the AI rewrite the failing
     // selector(s). The rewritten selectors are applied in place, so the immediate retry + all future
     // actions use them. resolve() is querySelector-safe against a bad heal.
-    const actionDiag = async (): Promise<string> =>
-      ((await wv
-        .executeJavaScript(
-          `(function(){var pick=function(el,d){if(!el||d<0)return null;var a={};for(var i=0;i<el.attributes.length;i++){var n=el.attributes[i].name;if(n==='class')a[n]=(el.className||'').slice(0,60);else if(/^data-|^aria-|^role$/.test(n))a[n]=(el.getAttribute(n)||'').slice(0,40);}return{tag:el.tagName,attrs:a,kids:[].slice.call(el.children).slice(0,8).map(function(c){return pick(c,d-1);}).filter(Boolean)};};return JSON.stringify({footer:pick(document.querySelector('#main footer'),3),popup:pick(document.querySelector('[role="listbox"]')||document.querySelector('#main [role="grid"]'),2),sampleRow:pick(document.querySelector('#main div[data-id]'),3),chatRow:pick(document.querySelector('#pane-side [role="row"]'),2),header:pick(document.querySelector('#main header'),2)});})()`
-        )
-        .catch(() => '{}')) as string)
+    const actionDiag = async (): Promise<string> => {
+      const r = await g.run('actionDiagnostic', gs.actionDiagnostic)
+      return r.ok ? r.value : '{}'
+    }
     const healActions = async (keys: string[]): Promise<string[]> => {
       try {
         const r = await invoke('wa:healSelectors', keys, await actionDiag())
@@ -320,65 +332,39 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
       wv.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 })
     }
     const triggerMediaDownload = async (messageId: string): Promise<void> => {
-      const rowSel = JSON.stringify(`#main div[data-id="${messageId.replace(/"/g, '\\"')}"]`)
-      const findVoicePoint = async (): Promise<string> =>
-        ((await wv
-          .executeJavaScript(
-            `(function(){var r=document.querySelector(${rowSel});if(!r)return '';var pb=r.querySelector(${JSON.stringify(sels.current.voicePlay)});if(pb){var b=pb.getBoundingClientRect();return JSON.stringify({x:Math.round(b.right+55),y:Math.round(b.top+b.height/2)});}return '';})()`
-          )
-          .catch(() => '')) as string)
-      let pointJson = await findVoicePoint()
-      if (!pointJson) {
+      const rowSel = `#main div[data-id="${messageId.replace(/"/g, '\\"')}"]`
+      const findVoicePoint = async (): Promise<gs.Point | null> => {
+        const r = await g.run('voiceMenuPoint', gs.voiceMenuPoint, rowSel, sels.current.voicePlay)
+        return r.ok ? r.value : null
+      }
+      let pt = await findVoicePoint()
+      if (!pt) {
         await healActions(['voicePlay'])
-        pointJson = await findVoicePoint()
+        pt = await findVoicePoint()
       }
-      if (!pointJson) return
-      let pt: { x: number; y: number }
-      try {
-        pt = JSON.parse(pointJson) as { x: number; y: number }
-      } catch {
-        return
-      }
+      if (!pt) return
       rightClickAt(pt.x, pt.y)
       await sleep(650)
-      const item = (await wv
-        .executeJavaScript(
-          `(function(){var items=[].slice.call(document.querySelectorAll('[role="button"],[role="menuitem"],li[role],div[role="button"],li'));for(var i=0;i<items.length;i++){if(/^download$/i.test((items[i].innerText||'').trim())){var b=items[i].getBoundingClientRect();return JSON.stringify({x:Math.round(b.left+b.width/2),y:Math.round(b.top+b.height/2)});}}return '';})()`
-        )
-        .catch(() => '')) as string
-      if (!item) return
-      try {
-        const q = JSON.parse(item) as { x: number; y: number }
-        leftClickAt(q.x, q.y)
-      } catch {
-        /* menu item vanished */
-      }
+      const item = await g.run('downloadMenuItemPoint', gs.downloadMenuItemPoint)
+      if (item.ok && item.value) leftClickAt(item.value.x, item.value.y)
     }
 
     // WAC-021 image capture: images expose a full-res blob in the DOM, so just fetch the bytes in
     // the guest page (executeJavaScript resolves the promise + returns the base64 — no console-size
     // limit, no download dance) and hand them to main for a vision description.
     const captureImage = async (messageId: string, ctx: Record<string, unknown>): Promise<void> => {
-      const rowSel = JSON.stringify(`#main div[data-id="${messageId.replace(/"/g, '\\"')}"]`)
-      const fetchBlob = async (): Promise<string> =>
-        ((await wv
-          .executeJavaScript(
-            `(function(){var r=document.querySelector(${rowSel});var im=r&&r.querySelector(${JSON.stringify(sels.current.imageBlob)});if(!im)return '';return fetch(im.src).then(function(res){return res.blob();}).then(function(b){if(!b||b.size>12000000)return '';return new Promise(function(resolve){var fr=new FileReader();fr.onload=function(){resolve(JSON.stringify({b64:String(fr.result).split(',')[1]||'',mime:b.type||'image/jpeg'}));};fr.onerror=function(){resolve('');};fr.readAsDataURL(b);});}).catch(function(){return '';});})()`
-          )
-          .catch(() => '')) as string)
-      let raw = await fetchBlob()
-      if (!raw) {
+      const rowSel = `#main div[data-id="${messageId.replace(/"/g, '\\"')}"]`
+      const fetchBlob = async (): Promise<{ b64: string; mime: string } | null> => {
+        const r = await g.run('imageBlob', gs.imageBlob, rowSel, sels.current.imageBlob)
+        return r.ok ? r.value : null
+      }
+      let img = await fetchBlob()
+      if (!img) {
         await healActions(['imageBlob'])
-        raw = await fetchBlob()
+        img = await fetchBlob()
       }
-      if (!raw) return
-      try {
-        const { b64, mime } = JSON.parse(raw) as { b64: string; mime: string }
-        if (!b64) return
-        void invoke('wa:describeImage', { ...ctx, messageId, image: b64, mime } as never)
-      } catch {
-        /* malformed */
-      }
+      if (!img || !img.b64) return
+      void invoke('wa:describeImage', { ...ctx, messageId, image: img.b64, mime: img.mime } as never)
     }
 
     // Health: the page has messages but we captured none ⇒ the recipe broke ⇒ trigger AI-heal.
@@ -393,7 +379,7 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
       if (phase.current === 'idle') {
         phase.current = 'awaitDiag'
         setHeal('healing')
-        void wv.executeJavaScript('window.__WA_DIAG_REQUEST=true;').catch(() => {})
+        void g.run('requestRecipeDiag', gs.requestRecipeDiag)
       } else if (phase.current === 'healed') {
         // The AI-rewritten recipe is ALSO broken → roll back to last-known-good, once, then stop.
         phase.current = 'done'
@@ -407,18 +393,22 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
       if (phase.current !== 'awaitDiag') return
       phase.current = 'healing'
       const res = await invoke('wa:heal', diag)
-      if (res.ok && res.recipe) {
+      if (res.ok && res.recipe && (await inject(res.recipe))) {
         brokenTicks.current = 0
-        await inject(res.recipe)
         phase.current = 'healed'
         setHeal('healed')
+      } else if (res.ok && res.recipe) {
+        // The rewrite threw on injection (its error is logged) → back to last-known-good now.
+        phase.current = 'done'
+        setHeal('failed')
+        void invoke('wa:rollbackRecipe').then((r) => inject(r.recipe))
       } else {
         phase.current = 'done'
         setHeal('failed') // no API key / model declined — keeps the current recipe
       }
     }
 
-    const onConsole = (e: { message?: string }): void => {
+    const onConsole = (e: WaWebviewEvent): void => {
       const m = e.message ?? ''
       if (m.startsWith('__WA_MSG__')) {
         try {
@@ -491,33 +481,24 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
         await new Promise((r) => setTimeout(r, 28))
       }
     }
-    const headerFirstLine = async (): Promise<string> =>
-      ((await wv
-        .executeJavaScript(`((document.querySelector(${JSON.stringify(sels.current.header)})||{innerText:''}).innerText.split('\\n')[0]||'').trim()`)
-        .catch(() => '')) as string)
-    const findRowRect = async (title: string): Promise<string> =>
-      ((await wv
-        .executeJavaScript(
-          `(function(){var rows=[].slice.call(document.querySelectorAll(${JSON.stringify(sels.current.chatRow)}));for(var i=0;i<rows.length;i++){var t=rows[i].querySelector(${JSON.stringify(sels.current.chatRowTitle)});if(t&&(t.getAttribute('title')||t.textContent||'').trim()===${JSON.stringify(title)}){var b=rows[i].getBoundingClientRect();return JSON.stringify({x:Math.round(b.left+b.width/2),y:Math.round(b.top+b.height/2)});}}return '';})()`
-        )
-        .catch(() => '')) as string)
+    const headerFirstLine = async (): Promise<string> => {
+      const r = await g.run('headerTitle', gs.headerTitle, sels.current.header)
+      return r.ok ? r.value : ''
+    }
+    const findRowPoint = async (title: string): Promise<gs.Point | null> => {
+      const r = await g.run('chatRowPoint', gs.chatRowPoint, sels.current.chatRow, sels.current.chatRowTitle, title)
+      return r.ok ? r.value : null
+    }
     const openGroupByTitle = async (title: string): Promise<boolean> => {
       if ((await headerFirstLine()) === title) return true
-      let rectJson = await findRowRect(title)
-      if (!rectJson) {
+      let p = await findRowPoint(title)
+      if (!p) {
         // chat-list selectors changed → AI-heal them, then retry finding the row
         await healActions(['chatRow', 'chatRowTitle'])
-        rectJson = await findRowRect(title)
+        p = await findRowPoint(title)
       }
-      if (!rectJson) return false
-      try {
-        const p = JSON.parse(rectJson) as { x: number; y: number }
-        wv.sendInputEvent({ type: 'mouseMove', x: p.x, y: p.y })
-        wv.sendInputEvent({ type: 'mouseDown', x: p.x, y: p.y, button: 'left', clickCount: 1 })
-        wv.sendInputEvent({ type: 'mouseUp', x: p.x, y: p.y, button: 'left', clickCount: 1 })
-      } catch {
-        return false
-      }
+      if (!p) return false
+      leftClickAt(p.x, p.y)
       await new Promise((r) => setTimeout(r, 1200))
       return (await headerFirstLine()) === title
     }
@@ -527,12 +508,10 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
         // WhatsApp's composer is a Lexical editor we can't reliably clear, so we NEVER clobber it: if
         // it holds a draft, abort (don't destroy the user's text). Insert via execCommand insertText
         // (emoji-safe). If the composer selector is stale, AI-heal it and retry once.
-        const tryInsert = async (): Promise<string> =>
-          ((await wv
-            .executeJavaScript(
-              `(function(){var c=document.querySelector(${JSON.stringify(sels.current.composer)});if(!c)return 'no-composer';if((c.innerText||'').trim())return 'not-empty';c.focus();document.execCommand('insertText',false,${JSON.stringify(payload.text)});return 'ok';})()`
-            )
-            .catch(() => 'err')) as string)
+        const tryInsert = async (): Promise<string> => {
+          const r = await g.run('insertIntoComposer', gs.insertIntoComposer, sels.current.composer, payload.text)
+          return r.ok ? r.value : 'err'
+        }
         let focused = await tryInsert()
         if (focused === 'no-composer') {
           await healActions(['composer'])
@@ -546,51 +525,41 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
         // sending if it still never appears — we won't post a dead "@name" that notifies nobody.
         if (payload.assignee) {
           const first = payload.assignee.split(/\s+/)[0]
-          await wv
-            .executeJavaScript(
-              `(function(){var c=document.querySelector(${JSON.stringify(sels.current.composer)});c.focus();var r=document.createRange();r.selectNodeContents(c);r.collapse(false);var s=getSelection();s.removeAllRanges();s.addRange(r);return '';})()`
-            )
-            .catch(() => undefined)
+          const caret = await g.run('caretToComposerEnd', gs.caretToComposerEnd, sels.current.composer)
+          if (!caret.ok || !caret.value) return { ok: false, error: 'Message box not found' }
           await typeStr(' @' + first.slice(0, 6))
           await new Promise((r) => setTimeout(r, 650))
-          const findOpt = async (): Promise<string> =>
-            ((await wv
-              .executeJavaScript(
-                `(function(){var cands=[].slice.call(document.querySelectorAll(${JSON.stringify(sels.current.mentionOption)}));for(var i=0;i<cands.length;i++){var tx=(cands[i].innerText||'').trim();if(new RegExp(${JSON.stringify(first.replace(/[^a-z0-9]/gi, ''))},'i').test(tx)){var b=cands[i].getBoundingClientRect();if(b.width>0&&b.height>0)return JSON.stringify({x:Math.round(b.left+b.width/2),y:Math.round(b.top+b.height/2)});}}return '';})()`
-              )
-              .catch(() => '')) as string)
-          let optJson = await findOpt()
-          if (!optJson) {
-            await healActions(['mentionOption'])
-            optJson = await findOpt()
+          const findOpt = async (): Promise<gs.Point | null> => {
+            const r = await g.run('mentionOptionPoint', gs.mentionOptionPoint, sels.current.mentionOption, first.replace(/[^a-z0-9]/gi, ''))
+            return r.ok ? r.value : null
           }
-          if (!optJson) return { ok: false, error: `Couldn't @mention "${payload.assignee}" — no autocomplete match. Nothing sent.` }
-          const opt = JSON.parse(optJson) as { x: number; y: number }
+          let opt = await findOpt()
+          if (!opt) {
+            await healActions(['mentionOption'])
+            opt = await findOpt()
+          }
+          if (!opt) return { ok: false, error: `Couldn't @mention "${payload.assignee}" — no autocomplete match. Nothing sent.` }
           leftClickAt(opt.x, opt.y) // select the mention (trusted click, not Enter)
           await new Promise((r) => setTimeout(r, 400))
         }
-        // Send by CLICKING the send button (appears once the composer has text) — not Enter. Returns
-        // 'empty' if the composer is empty (never fire a blank send), '' if the button selector is
-        // stale (→ AI-heal + retry), else the button rect.
-        const findBtn = async (): Promise<string> =>
-          ((await wv
-            .executeJavaScript(
-              `(function(){var c=document.querySelector(${JSON.stringify(sels.current.composer)});if(!c||!(c.innerText||'').trim())return 'empty';var b=document.querySelector(${JSON.stringify(sels.current.sendButton)});if(!b)return '';var el=b.closest('button')||b;var r=el.getBoundingClientRect();return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)});})()`
-            )
-            .catch(() => '')) as string)
-        let btnJson = await findBtn()
-        if (btnJson === '') {
-          await healActions(['sendButton'])
-          btnJson = await findBtn()
+        // Send by CLICKING the send button (appears once the composer has text) — not Enter. The
+        // guest returns 'empty' if the composer is empty (never fire a blank send), null if the
+        // button selector is stale (→ AI-heal + retry), else the button point. A failed guest call
+        // counts as 'empty' so it's never mistaken for a stale selector.
+        const findBtn = async (): Promise<gs.Point | 'empty' | null> => {
+          const r = await g.run('sendButtonPoint', gs.sendButtonPoint, sels.current.composer, sels.current.sendButton)
+          return r.ok ? r.value : 'empty'
         }
-        if (btnJson === 'empty' || btnJson === '') return { ok: false, error: 'Send button not found (nothing sent)' }
-        const btn = JSON.parse(btnJson) as { x: number; y: number }
+        let btn = await findBtn()
+        if (btn === null) {
+          await healActions(['sendButton'])
+          btn = await findBtn()
+        }
+        if (btn === 'empty' || btn === null) return { ok: false, error: 'Send button not found (nothing sent)' }
         leftClickAt(btn.x, btn.y) // send
         await new Promise((r) => setTimeout(r, 600))
-        const remaining = (await wv
-          .executeJavaScript(`(function(){var c=document.querySelector(${JSON.stringify(sels.current.composer)});return c?(c.innerText||'').trim():'x';})()`)
-          .catch(() => 'x')) as string
-        return remaining === '' ? { ok: true } : { ok: false, error: 'Send may not have completed' }
+        const remaining = await g.run('composerText', gs.composerText, sels.current.composer)
+        return remaining.ok && remaining.value === '' ? { ok: true } : { ok: false, error: 'Send may not have completed' }
       } catch (e) {
         return { ok: false, error: e instanceof Error ? e.message : 'send failed' }
       }
@@ -599,17 +568,22 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
 
     const domHandler = (): void => void onDom()
     wv.addEventListener('dom-ready', domHandler)
+    wv.addEventListener('did-start-navigation', onNavStart)
     wv.addEventListener('console-message', onConsole)
     return () => {
       registerWaSender(null)
+      g.setReady(false)
+      guest.current = null
       wv.removeEventListener('dom-ready', domHandler)
+      wv.removeEventListener('did-start-navigation', onNavStart)
       wv.removeEventListener('console-message', onConsole)
     }
   }, [])
 
   const runSweep = async (): Promise<void> => {
     const wv = ref.current as unknown as WaWebview | null
-    if (!wv || sweep.running) return
+    const g = guest.current
+    if (!wv || !g || sweep.running) return
     if (
       !window.confirm(
         'Read your chats?\n\nOpens chats so the assistant can read them — UNREAD chats first, ' +
@@ -629,27 +603,12 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
     const excluded = new Set(known.filter((c) => c.excluded).map((c) => c.id))
     const captured = new Set(known.map((c) => c.id)) // chats already in our store
 
-    // Re-read the CURRENTLY-visible chat rows each step (fresh coords + fresh unread state — the
-    // list re-renders as chats open). Coords are guest-viewport px = webview px.
-    type Row = { title: string; x: number; y: number; unread: boolean }
-    const visibleRows = async (): Promise<Row[]> => {
-      const json = (await wv
-        .executeJavaScript(
-          `(()=>{const rows=[...document.querySelectorAll('#pane-side [role="row"]')];return JSON.stringify(rows.map(function(r){var b=r.getBoundingClientRect();var t=(r.querySelector('span[title]')||{}).title||'';var u=!!r.querySelector('[aria-label*="unread" i]')||/\\b\\d+\\s*unread\\b/i.test(r.getAttribute('aria-label')||'');return {title:t,x:Math.round(b.left+b.width/2),y:Math.round(b.top+b.height/2),unread:u,ok:!!t&&b.top>64&&b.bottom<window.innerHeight-8&&b.width>120};}).filter(function(r){return r.ok;}));})()`
-        )
-        .catch(() => '[]')) as string
-      try {
-        return JSON.parse(json) as Row[]
-      } catch {
-        return []
-      }
-    }
-    const openHeader = async (): Promise<string> =>
-      ((await wv
-        .executeJavaScript(`((document.querySelector('#main header')||{innerText:''}).innerText.split('\n')[0]||'').trim()`)
-        .catch(() => '')) as string) || ''
-    const scrollDown = async (): Promise<void> => {
-      await wv.executeJavaScript(`(function(){var p=document.querySelector('#pane-side');if(!p)return;var g=p.querySelector('[role="grid"]')||p;(g.scrollBy?g:p).scrollBy(0,320);})()`).catch(() => {})
+    // Guest reads use the healable selectors (an action heal of chatRow/header fixes the sweep too).
+    // Rows are re-read every step (fresh coords + unread state — the list re-renders as chats open
+    // and as it scrolls). Coords are guest-viewport px = webview px.
+    const visibleRows = async (): Promise<gs.ChatRow[]> => {
+      const r = await g.run('visibleChatRows', gs.visibleChatRows, sels.current.chatRow, sels.current.chatRowTitle)
+      return r.ok ? r.value : []
     }
     // Real click: move → down → up. WhatsApp ignores synthetic clicks; sendInputEvent is trusted.
     const clickAt = (x: number, y: number): void => {
@@ -659,43 +618,33 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
     }
     // Human-like jitter so the pacing doesn't look like rapid-fire automation (lower ban signal).
     const jitter = (base: number): number => base + Math.floor(Math.random() * 500)
+    const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
-    const decided = new Set<string>() // titles we've opened OR deliberately skipped
-    let opened = 0
-    let stagnant = 0
-    let prevHeader = await openHeader()
     setSweep({ running: true, done: 0, total: SWEEP_MAX })
-    while (opened < SWEEP_MAX && stagnant < 5) {
-      const rows = (await visibleRows()).filter((r) => r.title && !decided.has(r.title))
-      // Skip (mark decided, don't open): out-of-scope (allow-list), excluded, and read+captured.
-      for (const r of rows) {
-        const s = slugify(r.title)
+    const { opened } = await sweepChats({
+      maxOpens: SWEEP_MAX,
+      visibleRows,
+      scroll: async () => {
+        const r = await g.run('scrollChatList', gs.scrollChatList, sels.current.chatRow)
+        return r.ok && r.value.moved
+      },
+      settle: () => sleep(jitter(400)),
+      open: async (row) => {
+        clickAt(row.x, row.y)
+        await sleep(jitter(SWEEP_DELAY_MS)) // let it open + the detector read it
+      },
+      header: async () => {
+        const r = await g.run('headerTitle', gs.headerTitle, sels.current.header)
+        return r.ok ? r.value : ''
+      },
+      // Skip (never open): out-of-scope (allow-list), excluded, and read+captured.
+      skip: (row) => {
+        const s = slugify(row.title)
         const outOfScope = includeSlugs.size > 0 && !includeSlugs.has(s)
-        if (outOfScope || excluded.has(s) || (!r.unread && captured.has(s))) decided.add(r.title)
-      }
-      const candidates = rows.filter((r) => !decided.has(r.title))
-      // Priority: unread first (new content / obligations), then never-captured chats (backfill).
-      candidates.sort((a, b) => (b.unread ? 1 : 0) - (a.unread ? 1 : 0))
-      const next = candidates[0]
-      if (!next) {
-        await scrollDown()
-        await new Promise((r) => setTimeout(r, jitter(400)))
-        stagnant++
-        continue
-      }
-      decided.add(next.title)
-      setSweep({ running: true, done: opened, total: SWEEP_MAX, current: (next.unread ? '🔵 ' : '') + next.title })
-      clickAt(next.x, next.y)
-      await new Promise((r) => setTimeout(r, jitter(SWEEP_DELAY_MS))) // let it open + the detector read it
-      const hdr = await openHeader()
-      if (hdr && hdr !== prevHeader) {
-        opened++
-        prevHeader = hdr
-        stagnant = 0
-      } else {
-        stagnant++ // click didn't open a new chat — try the next candidate
-      }
-    }
+        return outOfScope || excluded.has(s) || (!row.unread && captured.has(s))
+      },
+      onOpening: (row, done) => setSweep({ running: true, done, total: SWEEP_MAX, current: (row.unread ? '🔵 ' : '') + row.title })
+    })
     setSweep({ running: false, done: opened, total: opened })
     Analytics.WhatsApp.scanned({ count: opened })
   }
