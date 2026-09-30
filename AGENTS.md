@@ -1,0 +1,14 @@
+# Project agent memory
+
+This file is the project's committed home for project-intrinsic agent knowledge: build, test, release, architecture, and sharp-edge notes that should travel with the code.
+
+- Checks: `pnpm typecheck`, `pnpm lint`, `pnpm test` (Node's built-in runner over `test/**/*.test.ts`; Node strips the types, so test code must use erasable TS only).
+- Anything run inside the WhatsApp `<webview>` goes through `src/renderer/components/whatsapp/guest.ts` as a self-contained function (see `guest-scripts.ts`), never a hand-built `executeJavaScript` string. A guest-side throw otherwise surfaces only as Electron's opaque "Error occurred in handler for 'GUEST_VIEW_MANAGER_CALL': Script failed to execute" in the main log.
+- To exercise the live pane without a linked phone (or touching the real session/DB), run with `PA_WHATSAPP_URL` pointed at a local page that mimics WhatsApp's DOM, a separate `PA_WHATSAPP_PARTITION`, and `-- --user-data-dir=<tmp>` (electron-vite passes args after `--` to Electron).
+
+## Maintaining this file
+
+Keep this file for knowledge useful to almost every future agent session in this project.
+Do not repeat what the codebase already shows; point to the authoritative file or command instead.
+Prefer rewriting or pruning existing entries over appending new ones.
+When updating this file, preserve this bar for all agents and keep entries concise.

@@ -1,0 +1,182 @@
+// The functions the WhatsApp pane runs INSIDE the guest page, via guest.ts (which serializes them
+// with Function#toString). Each one must be self-contained — no references to module scope or
+// imports, only its own args plus the page's globals — and return a structured-clonable value.
+// Selectors are passed in (they're AI-healable data, see selectors.ts), never baked in.
+
+export type Point = { x: number; y: number }
+
+/** Enable the recipe's store + media reads and clear its run-once guard so a re-inject runs. */
+export function armRecipe(): void {
+  const w = window as unknown as Record<string, unknown>
+  w.__waCopilot = false
+  w.__WA_STORE_READ = true
+  w.__WA_AUDIO_READ = true
+}
+
+/** Ask the running recipe to emit a structure-only diagnostic on its next tick. */
+export function requestRecipeDiag(): void {
+  ;(window as unknown as Record<string, unknown>).__WA_DIAG_REQUEST = true
+}
+
+/** First line of the open chat's header (its title), or '' when no chat is open. */
+export function headerTitle(headerSel: string): string {
+  const h = document.querySelector<HTMLElement>(headerSel)
+  return ((h ? h.innerText : '').split('\n')[0] || '').trim()
+}
+
+/** Structure-only snapshot (tags/roles/data-icon/aria — never message text) for the action self-heal. */
+export function actionDiagnostic(): string {
+  type DiagNode = { tag: string; attrs: Record<string, string>; kids: DiagNode[] }
+  const pick = (el: Element | null, d: number): DiagNode | null => {
+    if (!el || d < 0) return null
+    const a: Record<string, string> = {}
+    for (let i = 0; i < el.attributes.length; i++) {
+      const n = el.attributes[i].name
+      if (n === 'class') a[n] = String(el.className || '').slice(0, 60)
+      else if (/^data-|^aria-|^role$/.test(n)) a[n] = (el.getAttribute(n) || '').slice(0, 40)
+    }
+    const kids = Array.from(el.children)
+      .slice(0, 8)
+      .map((c) => pick(c, d - 1))
+      .filter((k): k is DiagNode => !!k)
+    return { tag: el.tagName, attrs: a, kids }
+  }
+  return JSON.stringify({
+    footer: pick(document.querySelector('#main footer'), 3),
+    popup: pick(document.querySelector('[role="listbox"]') || document.querySelector('#main [role="grid"]'), 2),
+    sampleRow: pick(document.querySelector('#main div[data-id]'), 3),
+    chatRow: pick(document.querySelector('#pane-side [role="row"]'), 2),
+    header: pick(document.querySelector('#main header'), 2)
+  })
+}
+
+/** Where to right-click a voice note to get its message menu: just right of its Play button. */
+export function voiceMenuPoint(rowSel: string, voicePlaySel: string): Point | null {
+  const r = document.querySelector(rowSel)
+  const pb = r && r.querySelector(voicePlaySel)
+  if (!pb) return null
+  const b = pb.getBoundingClientRect()
+  return { x: Math.round(b.right + 55), y: Math.round(b.top + b.height / 2) }
+}
+
+/** Centre of the open context menu's "Download" item. */
+export function downloadMenuItemPoint(): Point | null {
+  const items = Array.from(document.querySelectorAll<HTMLElement>('[role="button"],[role="menuitem"],li[role],div[role="button"],li'))
+  for (const it of items) {
+    if (/^download$/i.test((it.innerText || '').trim())) {
+      const b = it.getBoundingClientRect()
+      return { x: Math.round(b.left + b.width / 2), y: Math.round(b.top + b.height / 2) }
+    }
+  }
+  return null
+}
+
+/** Read an image message's full-res blob as base64. null = no image in the row, or too large. */
+export async function imageBlob(rowSel: string, imageSel: string): Promise<{ b64: string; mime: string } | null> {
+  const r = document.querySelector(rowSel)
+  const im = r && r.querySelector<HTMLImageElement>(imageSel)
+  if (!im) return null
+  const b = await (await fetch(im.src)).blob()
+  if (!b || b.size > 12_000_000) return null
+  const url = await new Promise<string>((resolve, reject) => {
+    const fr = new FileReader()
+    fr.onload = () => resolve(String(fr.result))
+    fr.onerror = () => reject(fr.error || new Error('FileReader failed'))
+    fr.readAsDataURL(b)
+  })
+  return { b64: url.split(',')[1] || '', mime: b.type || 'image/jpeg' }
+}
+
+/** Centre of the chat-list row whose title is exactly `title`. */
+export function chatRowPoint(rowSel: string, titleSel: string, title: string): Point | null {
+  const rows = Array.from(document.querySelectorAll(rowSel))
+  for (const row of rows) {
+    const t = row.querySelector(titleSel)
+    if (t && (t.getAttribute('title') || t.textContent || '').trim() === title) {
+      const b = row.getBoundingClientRect()
+      return { x: Math.round(b.left + b.width / 2), y: Math.round(b.top + b.height / 2) }
+    }
+  }
+  return null
+}
+
+/**
+ * Put `text` into an EMPTY composer (execCommand insertText is emoji-safe). Never clobbers a
+ * draft the user is typing — WhatsApp's Lexical editor can't be reliably cleared.
+ */
+export function insertIntoComposer(composerSel: string, text: string): 'ok' | 'no-composer' | 'not-empty' {
+  const c = document.querySelector<HTMLElement>(composerSel)
+  if (!c) return 'no-composer'
+  if ((c.innerText || '').trim()) return 'not-empty'
+  c.focus()
+  document.execCommand('insertText', false, text)
+  return 'ok'
+}
+
+/** Focus the composer with the caret at the end (before typing the @mention). */
+export function caretToComposerEnd(composerSel: string): boolean {
+  const c = document.querySelector<HTMLElement>(composerSel)
+  if (!c) return false
+  c.focus()
+  const r = document.createRange()
+  r.selectNodeContents(c)
+  r.collapse(false)
+  const s = getSelection()
+  if (!s) return false
+  s.removeAllRanges()
+  s.addRange(r)
+  return true
+}
+
+/** Centre of a visible @mention autocomplete option matching `name` (alphanumerics only). */
+export function mentionOptionPoint(optionSel: string, name: string): Point | null {
+  const re = new RegExp(name, 'i')
+  const cands = Array.from(document.querySelectorAll<HTMLElement>(optionSel))
+  for (const c of cands) {
+    if (!re.test((c.innerText || '').trim())) continue
+    const b = c.getBoundingClientRect()
+    if (b.width > 0 && b.height > 0) return { x: Math.round(b.left + b.width / 2), y: Math.round(b.top + b.height / 2) }
+  }
+  return null
+}
+
+/** The send button's centre; 'empty' if the composer is empty (never fire a blank send); null if not found. */
+export function sendButtonPoint(composerSel: string, sendSel: string): Point | 'empty' | null {
+  const c = document.querySelector<HTMLElement>(composerSel)
+  if (!c || !(c.innerText || '').trim()) return 'empty'
+  const b = document.querySelector(sendSel)
+  if (!b) return null
+  const r = (b.closest('button') || b).getBoundingClientRect()
+  return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+}
+
+/** The composer's remaining text after a send ('' = sent); null if the composer is gone. */
+export function composerText(composerSel: string): string | null {
+  const c = document.querySelector<HTMLElement>(composerSel)
+  return c ? (c.innerText || '').trim() : null
+}
+
+export type ChatRow = { title: string; x: number; y: number; unread: boolean }
+
+/** The chat-list rows currently fully on screen (fresh coords + unread state for the sweep). */
+export function visibleChatRows(): ChatRow[] {
+  const rows = Array.from(document.querySelectorAll('#pane-side [role="row"]'))
+  const out: ChatRow[] = []
+  for (const r of rows) {
+    const b = r.getBoundingClientRect()
+    const t = (r.querySelector<HTMLElement>('span[title]') || { title: '' }).title || ''
+    const unread = !!r.querySelector('[aria-label*="unread" i]') || /\b\d+\s*unread\b/i.test(r.getAttribute('aria-label') || '')
+    if (t && b.top > 64 && b.bottom < window.innerHeight - 8 && b.width > 120) {
+      out.push({ title: t, x: Math.round(b.left + b.width / 2), y: Math.round(b.top + b.height / 2), unread })
+    }
+  }
+  return out
+}
+
+/** Scroll the chat list down one step (to reveal more rows for the sweep). */
+export function scrollChatList(): void {
+  const p = document.querySelector('#pane-side')
+  if (!p) return
+  const g = p.querySelector('[role="grid"]') || p
+  g.scrollBy(0, 320)
+}

@@ -55,6 +55,7 @@ page — it can never reach Node, the main process, or the rest of the app.
 pnpm install        # or npm install
 cp .env.example .env
 pnpm dev             # electron-vite dev
+pnpm test            # unit tests (Node's built-in runner)
 ```
 
 On first run, the WhatsApp tab shows a QR code — scan it with your phone (WhatsApp → Linked
