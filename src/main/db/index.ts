@@ -2,6 +2,7 @@ import { app } from 'electron'
 import { join } from 'path'
 import Database from 'better-sqlite3'
 import { SCHEMA_SQL } from './schema'
+import { migrate } from './migrate'
 
 // Single local SQLite handle for the app's operational state. better-sqlite3 is a
 // native module externalized by electron-vite; it runs only in the main process.
@@ -15,6 +16,7 @@ export function getDb(): Database.Database {
   db.pragma('journal_mode = WAL')
   db.pragma('foreign_keys = ON')
   db.exec(SCHEMA_SQL)
+  migrate(db)
   _db = db
   return db
 }

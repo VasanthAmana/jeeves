@@ -3,12 +3,14 @@ import { invoke, on } from '@/services/ipc'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { sendWaTask } from './wa-sender'
-import type { WaTopicView, WaActivityView } from '@shared/ipc-contract'
+import { ReplyPanel } from './reply-panel'
+import type { WaTopicView, WaActivityView, WaReplyTarget, WaTopicActionView } from '@shared/ipc-contract'
 
 // The Topics view: a conversation's matters as digest cards — title, status, summary,
 // consolidated action items — each REFERENCING its actual message bits. You can move a bit to
 // another topic (fixing miscategorisation; the move is pinned) and post a task back into the
-// source chat, @mentioning a participant. Grouped by chat.
+// source chat, @mentioning a participant. Grouped by chat. Any message bit or action item can be
+// replied to: its stored source reopens the exact chat and quotes the exact message (ReplyPanel).
 
 const STATUS_STYLE: Record<string, string> = {
   open: 'bg-amber-500/15 text-amber-300',
@@ -23,7 +25,7 @@ const PRIORITY_STYLE: Record<string, string> = {
 }
 const PRIORITY_SEQ = ['low', 'normal', 'high'] as const
 
-export function TopicsView(): React.JSX.Element {
+export function TopicsView({ onShowWhatsApp }: { onShowWhatsApp?: () => void }): React.JSX.Element {
   const [topics, setTopics] = useState<WaTopicView[]>([])
   const [activity, setActivity] = useState<WaActivityView[]>([])
   const [refreshing, setRefreshing] = useState(false)
@@ -174,7 +176,15 @@ export function TopicsView(): React.JSX.Element {
                         </div>
                       )}
                       {c.topics.map((t) => (
-                        <TopicCard key={t.id} topic={t} siblings={c.topics} onChange={refresh} onFilterTag={toggleTag} activeTags={tagFilter} />
+                        <TopicCard
+                          key={t.id}
+                          topic={t}
+                          siblings={c.topics}
+                          onChange={refresh}
+                          onFilterTag={toggleTag}
+                          activeTags={tagFilter}
+                          onShowWhatsApp={onShowWhatsApp}
+                        />
                       ))}
                     </div>
                   )}
@@ -193,15 +203,24 @@ function TopicCard({
   siblings,
   onChange,
   onFilterTag,
-  activeTags
+  activeTags,
+  onShowWhatsApp
 }: {
   topic: WaTopicView
   siblings: WaTopicView[]
   onChange: () => void
   onFilterTag: (tag: string) => void
   activeTags: Set<string>
+  onShowWhatsApp?: () => void
 }): React.JSX.Element {
   const [busy, setBusy] = useState<string | null>(null)
+  const [reply, setReply] = useState<WaReplyTarget | null>(null)
+  const replyTo = (messageId?: string): void => setReply({ conversationId: topic.conversation_id, ...(messageId ? { messageId } : {}) })
+  // An action item replies to the message it came from: its latest incoming evidence (else its latest).
+  const actionReplyMessage = (a: WaTopicActionView): string | undefined => {
+    const ev = [...a.evidence].sort((x, y) => x.timestamp - y.timestamp)
+    return (ev.filter((e) => e.direction === 'incoming').at(-1) ?? ev.at(-1))?.messageId
+  }
   const [assign, setAssign] = useState<{ participants: string[]; isGroup: boolean; assignee: string } | null>(null)
   const [sent, setSent] = useState<string | null>(null)
 
@@ -347,16 +366,29 @@ function TopicCard({
         </div>
       )}
 
+      {reply && <ReplyPanel key={`${reply.conversationId}|${reply.messageId ?? ''}`} target={reply} onClose={() => setReply(null)} onShowWhatsApp={onShowWhatsApp} />}
+
       {topic.action_items.length > 0 && (
         <div className="mt-2 space-y-1">
-          {topic.action_items.map((a, i) => (
-            <div key={i} className="flex items-center gap-2 text-xs">
-              <Badge variant="secondary">{a.type.replace('_', ' ')}</Badge>
-              <span className="text-foreground">{a.text}</span>
-              {a.owner && <span className="text-muted-foreground">· {a.owner}</span>}
-              {a.due && <span className="text-muted-foreground">· due {a.due}</span>}
-            </div>
-          ))}
+          {topic.action_items.map((a, i) => {
+            const mid = actionReplyMessage(a)
+            const src = a.evidence.find((e) => e.messageId === mid)
+            return (
+              <div key={i} className="flex items-center gap-2 text-xs">
+                <Badge variant="secondary">{a.type.replace('_', ' ')}</Badge>
+                <span className="text-foreground">{a.text}</span>
+                {a.owner && <span className="text-muted-foreground">· {a.owner}</span>}
+                {a.due && <span className="text-muted-foreground">· due {a.due}</span>}
+                <button
+                  onClick={() => replyTo(mid)}
+                  className="ml-auto shrink-0 text-[10px] text-muted-foreground hover:text-foreground"
+                  title={src ? `Reply to ${src.direction === 'outgoing' ? 'your' : `${src.sender ?? 'their'}`} message: “${src.text.slice(0, 80)}”` : 'Reply in this chat'}
+                >
+                  ↩ Reply
+                </button>
+              </div>
+            )
+          })}
         </div>
       )}
 
@@ -372,7 +404,19 @@ function TopicCard({
                 <span className="min-w-0 flex-1 whitespace-pre-wrap text-muted-foreground">
                   {m.text}
                   {m.pinned && <span className="ml-1 text-[10px] text-amber-300" title="You moved this here — re-analysis won't move it">📌</span>}
+                  {m.source.status === 'title-only' && (
+                    <span className="ml-1 text-[10px] text-muted-foreground/70" title="Saved before Jeeves kept message sources — replying reopens the chat by name and may not be able to quote it">
+                      (no source)
+                    </span>
+                  )}
                 </span>
+                <button
+                  onClick={() => replyTo(m.message_id)}
+                  className="shrink-0 text-[10px] text-muted-foreground hover:text-foreground"
+                  title="Reply to this message in WhatsApp (staged, never sent)"
+                >
+                  ↩
+                </button>
                 <select
                   className="shrink-0 rounded border border-border bg-background px-1 py-0.5 text-[10px] text-muted-foreground"
                   value=""

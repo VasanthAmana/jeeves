@@ -206,3 +206,85 @@ export function scrollChatList(rowSel: string): { moved: boolean } {
   sc.scrollTop = before + Math.max(200, Math.round(sc.clientHeight * 0.8))
   return { moved: sc.scrollTop > before }
 }
+
+// ── Reply staging (reply-stager.ts) ──────────────────────────────────────────────────────────
+// Open a stored message's exact chat, quote that message, and put a draft in the box. Nothing here
+// ever sends — there's deliberately no send step on this path.
+
+/** The open chat: its header title, how many message rows are loaded, and whether any is from `chatJid`. */
+export function openChatCheck(headerSel: string, chatJid: string, messageId: string): { title: string; rows: number; jidRows: number; hasMessage: boolean } {
+  const h = document.querySelector<HTMLElement>(headerSel)
+  const title = ((h ? h.innerText : '').split('\n')[0] || '').trim()
+  const rows = Array.from(document.querySelectorAll('#main [data-id]'))
+  // A WhatsApp message key is <fromMe>_<chat JID>_<id>[_<participant>] — the chat JID is embedded.
+  const jidRows = chatJid ? rows.filter((r) => (r.getAttribute('data-id') || '').indexOf('_' + chatJid + '_') > 0).length : 0
+  const hasMessage = !!messageId && rows.some((r) => r.getAttribute('data-id') === messageId)
+  return { title, rows: rows.length, jidRows, hasMessage }
+}
+
+/** Scroll a message into view and return a point on its bubble (for its context menu); null if not loaded. */
+export function messageBubblePoint(messageId: string): Point | null {
+  const row = Array.from(document.querySelectorAll('#main [data-id]')).find((r) => r.getAttribute('data-id') === messageId)
+  if (!row) return null
+  const bubble = row.querySelector('[data-pre-plain-text]') || row.querySelector('.copyable-text') || row.querySelector('.selectable-text') || row
+  if (typeof (bubble as HTMLElement).scrollIntoView === 'function') (bubble as HTMLElement).scrollIntoView({ block: 'center' })
+  const b = bubble.getBoundingClientRect()
+  if (!(b.width > 0 && b.height > 0)) return null
+  return { x: Math.round(b.left + Math.min(b.width / 2, 40)), y: Math.round(b.top + b.height / 2) }
+}
+
+/** Centre of the open context menu's item labelled exactly `label` (case-insensitive). */
+export function menuItemPoint(label: string): Point | null {
+  const want = String(label || '').trim().toLowerCase()
+  if (!want) return null
+  const items = Array.from(document.querySelectorAll<HTMLElement>('[role="menuitem"],[role="button"],li[role],div[role="button"],li'))
+  for (const it of items) {
+    if ((it.innerText || '').trim().toLowerCase() !== want) continue
+    const b = it.getBoundingClientRect()
+    if (b.width > 0 && b.height > 0) return { x: Math.round(b.left + b.width / 2), y: Math.round(b.top + b.height / 2) }
+  }
+  return null
+}
+
+/** Whether a reply-quote is attached above the composer: any of `expect` shows in the footer (names: as a whole word), outside the box itself. */
+export function quoteAttached(composerSel: string, expect: string[], names: string[]): boolean {
+  const c = document.querySelector<HTMLElement>(composerSel)
+  const footer = (c && c.closest('footer')) || document.querySelector('#main footer')
+  if (!footer) return false
+  let text = footer.innerText || ''
+  const typed = c ? c.innerText || '' : ''
+  if (typed) text = text.split(typed).join(' ')
+  const norm = (s: string): string => s.replace(/\s+/g, ' ').trim().toLowerCase()
+  const hay = norm(text)
+  const word = (e: string): boolean => new RegExp('(?<![\\p{L}\\p{N}])' + e.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?![\\p{L}\\p{N}])', 'u').test(hay)
+  return expect.map(norm).some((e) => e.length > 0 && hay.includes(e)) || names.map(norm).some((e) => e.length > 0 && word(e))
+}
+
+/** Type `query` into the chat-list search box (clearing it first). false = no search box. */
+export function searchChats(searchSel: string, query: string): boolean {
+  const s = document.querySelector<HTMLElement>(searchSel)
+  if (!s) return false
+  s.focus()
+  if (s.tagName === 'INPUT') {
+    ;(s as HTMLInputElement).value = query
+    s.dispatchEvent(new Event('input', { bubbles: true }))
+    return true
+  }
+  document.execCommand('selectAll', false)
+  document.execCommand('insertText', false, query)
+  return true
+}
+
+/** Empty the chat-list search box again (so the list goes back to normal). */
+export function clearChatSearch(searchSel: string): void {
+  const s = document.querySelector<HTMLElement>(searchSel)
+  if (!s) return
+  s.focus()
+  if (s.tagName === 'INPUT') {
+    ;(s as HTMLInputElement).value = ''
+    s.dispatchEvent(new Event('input', { bubbles: true }))
+    return
+  }
+  document.execCommand('selectAll', false)
+  document.execCommand('delete', false)
+}

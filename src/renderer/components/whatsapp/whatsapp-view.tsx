@@ -5,11 +5,23 @@ import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { TopicsView } from './topics-view'
-import { registerWaSender, type WaTaskSend } from './wa-sender'
+import { registerWaReplyStager, registerWaSender, type WaTaskSend } from './wa-sender'
 import { createGuest, type Guest } from './guest'
 import { sweepChats } from './sweep'
 import * as gs from './guest-scripts'
-import type { NormalizedMessage, WaConversationView, WaMessageView, WaSessionState, WaWebviewConfig } from '@shared/ipc-contract'
+import { stageReply } from './reply-stager'
+import { ReplyPanel } from './reply-panel'
+import { SweepProgressBadge } from './sweep-progress'
+import { useSweepProgress } from './use-sweep-progress'
+import type {
+  NormalizedMessage,
+  WaConversationView,
+  WaMessageView,
+  WaReplyTarget,
+  WaSessionState,
+  WaSweepEvent,
+  WaWebviewConfig
+} from '@shared/ipc-contract'
 
 // The imperative bits of Electron's <webview> we call (the element is an HTMLElement subclass).
 // Scripts never go through executeJavaScript directly — only via guest.ts (see there for why).
@@ -55,6 +67,9 @@ export function WhatsAppView(): React.JSX.Element {
   const [scopeOpen, setScopeOpen] = useState(false)
   const [scopeText, setScopeText] = useState('')
   const [tab, setTab] = useState<'chats' | 'topics'>('chats')
+  // Chat-sweep progress (pushed by main); a finished/stopped result stays until dismissed.
+  const progress = useSweepProgress()
+  const [dismissedSweep, setDismissedSweep] = useState<number | null>(null)
 
   const refresh = (): void => {
     void invoke('wa:listChats').then(setChats)
@@ -127,7 +142,11 @@ export function WhatsAppView(): React.JSX.Element {
             Topics
           </Button>
         </div>
-        <span className="flex-1" />
+        <span className="flex min-w-0 flex-1 justify-center">
+          {progress.endedAt === null || progress.endedAt !== dismissedSweep ? (
+            <SweepProgressBadge progress={progress} onDismiss={() => setDismissedSweep(progress.endedAt)} />
+          ) : null}
+        </span>
         <Button size="sm" variant={include.length ? 'secondary' : 'ghost'} onClick={openScope} title="Analyse ONLY these chats (allow-list). Empty = all chats.">
           {include.length ? `Analysing ${include.length} chat${include.length === 1 ? '' : 's'}` : 'Scope: all chats'}
         </Button>
@@ -177,7 +196,7 @@ export function WhatsAppView(): React.JSX.Element {
       )}
       {tab === 'topics' ? (
         // Topics: conversation matters as digest cards (title + action items + message bits).
-        <TopicsView />
+        <TopicsView onShowWhatsApp={() => setTab('chats')} />
       ) : !live ? (
         // Demo: our own chat list + conversation panes over the seeded sample data.
         <div className="flex min-h-0 flex-1">
@@ -240,7 +259,11 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
   // The guest-script runner for this webview (created on mount; shared with the sweep).
   const guest = useRef<Guest | null>(null)
   const [loaded, setLoaded] = useState(false)
-  const [sweep, setSweep] = useState<{ running: boolean; done: number; total: number; current?: string }>({ running: false, done: 0, total: 0 })
+  // Sweep progress lives in main (it counts what was actually captured); the pane reports each step
+  // via wa:sweepEvent and renders main's pushes. Refs: the loop reads them across awaits.
+  const progress = useSweepProgress()
+  const sweepRunning = useRef(false)
+  const stopSweep = useRef(false)
   const [heal, setHeal] = useState<'ok' | 'healing' | 'healed' | 'failed'>('ok')
   // Self-heal state machine (refs so the stable console-message handler can read/write them).
   const phase = useRef<'idle' | 'awaitDiag' | 'healing' | 'healed' | 'done'>('idle')
@@ -255,7 +278,8 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
     sendButton: '#main footer [data-icon="send"], #main footer button[aria-label*="Send" i], #main footer span[data-icon="send"]',
     mentionOption: '#main [role="listbox"] [role="option"], #main [role="option"]',
     voicePlay: 'button[aria-label*="Play voice" i], [data-icon="ptt-status"]',
-    imageBlob: 'img[src^="blob:"]'
+    imageBlob: 'img[src^="blob:"]',
+    chatSearch: '#side [contenteditable="true"][role="textbox"], #side div[contenteditable="true"], #side input[type="text"]'
   })
 
   useEffect(() => {
@@ -566,12 +590,34 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
     }
     registerWaSender(sendTaskImpl)
 
+    // Reply staging (reply-stager.ts): open a stored message's exact chat, quote it, and put the
+    // draft in the box. Never sends — the user presses Send in WhatsApp themselves.
+    registerWaReplyStager((plan) =>
+      stageReply(
+        {
+          guest: g,
+          sels: () => sels.current,
+          click: (p) => leftClickAt(p.x, p.y),
+          rightClick: (p) => rightClickAt(p.x, p.y),
+          escape: () => {
+            wv.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' })
+            wv.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' })
+          },
+          sleep,
+          heal: healActions
+        },
+        plan
+      )
+    )
+
     const domHandler = (): void => void onDom()
     wv.addEventListener('dom-ready', domHandler)
     wv.addEventListener('did-start-navigation', onNavStart)
     wv.addEventListener('console-message', onConsole)
     return () => {
       registerWaSender(null)
+      registerWaReplyStager(null)
+      stopSweep.current = true // an unmounted pane can't keep driving the sweep
       g.setReady(false)
       guest.current = null
       wv.removeEventListener('dom-ready', domHandler)
@@ -583,7 +629,7 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
   const runSweep = async (): Promise<void> => {
     const wv = ref.current as unknown as WaWebview | null
     const g = guest.current
-    if (!wv || !g || sweep.running) return
+    if (!wv || !g || sweepRunning.current) return
     if (
       !window.confirm(
         'Read your chats?\n\nOpens chats so the assistant can read them — UNREAD chats first, ' +
@@ -620,32 +666,59 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
     const jitter = (base: number): number => base + Math.floor(Math.random() * 500)
     const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
-    setSweep({ running: true, done: 0, total: SWEEP_MAX })
-    const { opened } = await sweepChats({
-      maxOpens: SWEEP_MAX,
-      visibleRows,
-      scroll: async () => {
-        const r = await g.run('scrollChatList', gs.scrollChatList, sels.current.chatRow)
-        return r.ok && r.value.moved
-      },
-      settle: () => sleep(jitter(400)),
-      open: async (row) => {
-        clickAt(row.x, row.y)
-        await sleep(jitter(SWEEP_DELAY_MS)) // let it open + the detector read it
-      },
-      header: async () => {
-        const r = await g.run('headerTitle', gs.headerTitle, sels.current.header)
-        return r.ok ? r.value : ''
-      },
-      // Skip (never open): out-of-scope (allow-list), excluded, and read+captured.
-      skip: (row) => {
-        const s = slugify(row.title)
-        const outOfScope = includeSlugs.size > 0 && !includeSlugs.has(s)
-        return outOfScope || excluded.has(s) || (!row.unread && captured.has(s))
-      },
-      onOpening: (row, done) => setSweep({ running: true, done, total: SWEEP_MAX, current: (row.unread ? '🔵 ' : '') + row.title })
-    })
-    setSweep({ running: false, done: opened, total: opened })
+    // Progress: each step goes to main (wa:sweepEvent), which counts the captured messages and
+    // pushes the live numbers back to the UI (whatsapp:sweepProgress).
+    const report = (e: WaSweepEvent): void => void invoke('wa:sweepEvent', e).catch(() => undefined)
+    sweepRunning.current = true
+    stopSweep.current = false
+    report({ type: 'start', limit: SWEEP_MAX })
+    let opened = 0
+    try {
+      const res = await sweepChats({
+        maxOpens: SWEEP_MAX,
+        visibleRows,
+        scroll: async () => {
+          const r = await g.run('scrollChatList', gs.scrollChatList, sels.current.chatRow)
+          return r.ok && r.value.moved
+        },
+        settle: () => sleep(jitter(400)),
+        open: async (row) => {
+          clickAt(row.x, row.y)
+          await sleep(jitter(SWEEP_DELAY_MS)) // let it open + the detector read it
+        },
+        header: async () => {
+          const r = await g.run('headerTitle', gs.headerTitle, sels.current.header)
+          return r.ok ? r.value : ''
+        },
+        // Skip (never open): out-of-scope (allow-list), excluded, and read+captured.
+        skip: (row) => {
+          const s = slugify(row.title)
+          const outOfScope = includeSlugs.size > 0 && !includeSlugs.has(s)
+          return outOfScope || excluded.has(s) || (!row.unread && captured.has(s))
+        },
+        stopped: () => stopSweep.current,
+        onFound: (count) => report({ type: 'found', count }),
+        onOpening: (row) => report({ type: 'opening', title: row.title }),
+        onRead: (row) => report({ type: 'read', title: row.title })
+      })
+      opened = res.opened
+      const stopped = stopSweep.current
+      report({
+        type: 'end',
+        stopped,
+        note: stopped
+          ? 'Stopped before finishing'
+          : res.reachedEnd
+            ? 'Reached the end of the chat list'
+            : opened >= SWEEP_MAX
+              ? `Reached the ${SWEEP_MAX}-chat limit for one sweep`
+              : 'Stopped: chats stopped opening when clicked'
+      })
+    } catch (e) {
+      report({ type: 'end', stopped: true, note: `Stopped: ${e instanceof Error ? e.message : String(e)}` })
+    } finally {
+      sweepRunning.current = false
+    }
     Analytics.WhatsApp.scanned({ count: opened })
   }
 
@@ -657,22 +730,29 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
         {heal === 'healed' && <span className="text-emerald-400">✓ Reader auto-updated</span>}
         {heal === 'failed' && <span className="text-red-400" title="Reading broke and could not be auto-fixed (needs an API key or a manual recipe update)">⚠ Reader needs attention</span>}
         <span className="flex-1" />
-        {sweep.running ? (
-          <span className="text-amber-300">
-            Reading {sweep.done + 1}/{sweep.total}: {sweep.current ?? '…'}
-          </span>
+        {progress.state === 'running' ? (
+          // The live counts show in the banner above (visible on every tab); here, just a way out.
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              stopSweep.current = true
+              // A sweep this pane isn't driving (e.g. left over from before a reload): end it in main now.
+              if (!sweepRunning.current) void invoke('wa:sweepEvent', { type: 'end', stopped: true, note: 'Stopped' }).catch(() => undefined)
+            }}
+            title="Stop after the chat being read now"
+          >
+            ■ Stop reading
+          </Button>
         ) : (
-          <>
-            {sweep.total > 0 && <span className="text-emerald-400">Read {sweep.total} chats</span>}
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => void runSweep()}
-              title="Opens each visible chat so the assistant can read it — marks them read + sends read receipts"
-            >
-              ⤵ Read my chats
-            </Button>
-          </>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void runSweep()}
+            title="Opens each visible chat so the assistant can read it — marks them read + sends read receipts"
+          >
+            ⤵ Read my chats
+          </Button>
         )}
       </div>
       <div className="relative min-h-0 flex-1">
@@ -699,6 +779,7 @@ function Conversation({ id, onExcludedChange }: { id: string; onExcludedChange: 
   const [messages, setMessages] = useState<WaMessageView[]>([])
   const [draft, setDraft] = useState<string | null>(null)
   const [drafting, setDrafting] = useState(false)
+  const [reply, setReply] = useState<WaReplyTarget | null>(null)
 
   const load = (): void => {
     void invoke('wa:getConversation', id).then((r) => {
@@ -768,7 +849,18 @@ function Conversation({ id, onExcludedChange }: { id: string; onExcludedChange: 
             >
               {m.direction === 'incoming' && m.sender && <div className="text-[11px] font-semibold text-muted-foreground">{m.sender}</div>}
               <div className="whitespace-pre-wrap">{m.text}</div>
-              <div className="mt-0.5 text-right text-[10px] text-muted-foreground">{new Date(m.timestamp).toLocaleTimeString()}</div>
+              <div className="mt-0.5 flex items-center justify-end gap-2 text-[10px] text-muted-foreground">
+                {!conversation.excluded && (
+                  <button
+                    onClick={() => setReply({ conversationId: id, messageId: m.message_id })}
+                    className="hover:text-foreground"
+                    title="Reply to this message (drafted and staged, never sent)"
+                  >
+                    ↩ Reply
+                  </button>
+                )}
+                <span>{new Date(m.timestamp).toLocaleTimeString()}</span>
+              </div>
             </div>
           ))}
           {messages.length === 0 && <p className="text-sm text-muted-foreground">No messages.</p>}
@@ -778,6 +870,11 @@ function Conversation({ id, onExcludedChange }: { id: string; onExcludedChange: 
       {/* gated draft reply — Level 2: drafts only, never sends */}
       {!conversation.excluded && (
         <div className="shrink-0 border-t border-border p-3">
+          {reply && (
+            <div className="mb-2">
+              <ReplyPanel key={reply.messageId} target={reply} onClose={() => setReply(null)} />
+            </div>
+          )}
           {draft === null ? (
             <Button size="sm" variant="secondary" onClick={() => void doDraft()} disabled={drafting}>
               {drafting ? 'Drafting…' : '✎ Draft a reply'}

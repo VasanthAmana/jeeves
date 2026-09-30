@@ -1,12 +1,14 @@
 import type Database from 'better-sqlite3'
-import { slugifyTitle } from './scope'
-import type { WhatsappTopic, WaTopicView, WaTopicMessage } from '../../shared/ipc-contract'
+import { slugifyTitle } from './source'
+import { resolveSources, topicMessages } from './store'
+import type { WhatsappTopic, WhatsappTopicAction, WaTopicView, WaTopicMessage } from '../../shared/ipc-contract'
 
 // Topic persistence (WAC-009-topics). A topic is a whole matter (title + summary + status +
 // consolidated action items); each captured message is assigned to a topic (wa_messages.topic_id),
 // and a topic's "conversation bits" are its assigned messages. Grouping into EXISTING topics is
 // the extractor's job (it's given the current topics); user moves PIN a message so re-extraction
-// won't override the correction. db-first-arg idiom, testable without Electron.
+// won't override the correction. db-first-arg idiom, testable without Electron. Every message bit and
+// every action's evidence id is hydrated with its source (exact chat + message) so it can be replied to.
 
 interface TopicRow {
   id: string
@@ -70,26 +72,26 @@ export function upsertTopic(db: Database.Database, conversationId: string, conve
 }
 
 function hydrate(db: Database.Database, row: TopicRow): WaTopicView {
-  const msgs = db
-    .prepare(
-      `SELECT message_id, direction, sender, text, timestamp, topic_pinned
-       FROM wa_messages WHERE topic_id = ? ORDER BY timestamp ASC`
-    )
-    .all(row.id) as { message_id: string; direction: 'incoming' | 'outgoing'; sender: string | null; text: string; timestamp: number; topic_pinned: number }[]
-  const messages: WaTopicMessage[] = msgs.map((m) => ({
+  const messages: WaTopicMessage[] = topicMessages(db, row.id).map((m) => ({
     message_id: m.message_id,
     direction: m.direction,
-    sender: m.sender ?? undefined,
+    sender: m.sender,
     text: m.text,
     timestamp: m.timestamp,
-    pinned: !!m.topic_pinned
+    pinned: m.pinned,
+    source: m.source
   }))
-  let actions: WaTopicView['action_items'] = []
+  let stored: WhatsappTopicAction[] = []
   try {
-    actions = JSON.parse(row.action_items || '[]')
+    const a = JSON.parse(row.action_items || '[]')
+    stored = Array.isArray(a) ? a : []
   } catch {
-    actions = []
+    stored = []
   }
+  const actions: WaTopicView['action_items'] = stored.map((a) => ({
+    ...a,
+    evidence: resolveSources(db, row.conversation_id, Array.isArray(a.evidence_message_ids) ? a.evidence_message_ids : [])
+  }))
   return {
     id: row.id,
     conversation_id: row.conversation_id,
