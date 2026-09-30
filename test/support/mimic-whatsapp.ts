@@ -185,6 +185,8 @@ export class MimicWhatsApp {
   focus: string | null = null
   selectAll = false
   menuHasReply = true
+  replyAttachesQuote = true
+  footerHint = ''
   // What a test asserts on:
   sent: string[] = [] // anything the Send button actually sent (must stay empty on the reply path)
   clicks: { x: number; y: number; button: string; hit: string }[] = []
@@ -263,7 +265,7 @@ export class MimicWhatsApp {
       main = e('div', { id: 'main' }).add(
         e('header', {}, '', { x: 320, y: 0, w: 900, h: 60 }).add(e('span', { dir: 'auto' }, chat.title), e('span', {}, 'click here for contact info')),
         list,
-        e('footer').add(quotePanel, e('div', { class: 'lexical-rich-text-input' }).add(composer), send)
+        e('footer').add(this.footerHint ? e('span', {}, this.footerHint) : null, quotePanel, e('div', { class: 'lexical-rich-text-input' }).add(composer), send)
       )
     }
 
@@ -278,7 +280,7 @@ export class MimicWhatsApp {
             li.on.click = () => {
               this.menu = null
               if (label === 'Reply') {
-                this.quote = this.chats.flatMap((c) => c.messages).find((m) => m.dataId === dataId) ?? null
+                this.quote = this.replyAttachesQuote ? (this.chats.flatMap((c) => c.messages).find((m) => m.dataId === dataId) ?? null) : null
                 this.focus = 'composer'
               }
             }

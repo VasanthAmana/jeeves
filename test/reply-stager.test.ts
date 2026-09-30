@@ -209,3 +209,18 @@ test('an excluded chat is never drafted for (its messages must not reach a model
   })
   assert.equal(resolveReplyTarget(db, { conversationId: 'site-team', messageId: 'nope' }).ok, false)
 })
+
+test('an outgoing message whose quote never attached is not reported quoted just because the footer says "you"', async () => {
+  const page = new MimicWhatsApp(chats())
+  page.replyAttachesQuote = false
+  page.footerHint = 'Would you like to add a caption?'
+  const mine = chats()[1].messages[2]
+  const plan = planFor({ conversationId: 'site-team', messageId: mine.dataId }, [captured('Site Team', mine)])
+
+  const r = await stageReply(deps(page), plan)
+
+  assert.equal(page.quote, null)
+  assert.equal(r.quoted, false)
+  assert.match(r.note ?? '', /couldn’t confirm the quote/)
+  assert.deepEqual(page.sent, [])
+})

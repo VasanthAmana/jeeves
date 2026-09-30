@@ -672,46 +672,53 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
     sweepRunning.current = true
     stopSweep.current = false
     report({ type: 'start', limit: SWEEP_MAX })
-    const { opened, reachedEnd } = await sweepChats({
-      maxOpens: SWEEP_MAX,
-      visibleRows,
-      scroll: async () => {
-        const r = await g.run('scrollChatList', gs.scrollChatList, sels.current.chatRow)
-        return r.ok && r.value.moved
-      },
-      settle: () => sleep(jitter(400)),
-      open: async (row) => {
-        clickAt(row.x, row.y)
-        await sleep(jitter(SWEEP_DELAY_MS)) // let it open + the detector read it
-      },
-      header: async () => {
-        const r = await g.run('headerTitle', gs.headerTitle, sels.current.header)
-        return r.ok ? r.value : ''
-      },
-      // Skip (never open): out-of-scope (allow-list), excluded, and read+captured.
-      skip: (row) => {
-        const s = slugify(row.title)
-        const outOfScope = includeSlugs.size > 0 && !includeSlugs.has(s)
-        return outOfScope || excluded.has(s) || (!row.unread && captured.has(s))
-      },
-      stopped: () => stopSweep.current,
-      onFound: (count) => report({ type: 'found', count }),
-      onOpening: (row) => report({ type: 'opening', title: row.title }),
-      onRead: (row) => report({ type: 'read', title: row.title })
-    })
-    const stopped = stopSweep.current
-    report({
-      type: 'end',
-      stopped,
-      note: stopped
-        ? 'Stopped before finishing'
-        : reachedEnd
-          ? 'Reached the end of the chat list'
-          : opened >= SWEEP_MAX
-            ? `Reached the ${SWEEP_MAX}-chat limit for one sweep`
-            : 'Stopped: chats stopped opening when clicked'
-    })
-    sweepRunning.current = false
+    let opened = 0
+    try {
+      const res = await sweepChats({
+        maxOpens: SWEEP_MAX,
+        visibleRows,
+        scroll: async () => {
+          const r = await g.run('scrollChatList', gs.scrollChatList, sels.current.chatRow)
+          return r.ok && r.value.moved
+        },
+        settle: () => sleep(jitter(400)),
+        open: async (row) => {
+          clickAt(row.x, row.y)
+          await sleep(jitter(SWEEP_DELAY_MS)) // let it open + the detector read it
+        },
+        header: async () => {
+          const r = await g.run('headerTitle', gs.headerTitle, sels.current.header)
+          return r.ok ? r.value : ''
+        },
+        // Skip (never open): out-of-scope (allow-list), excluded, and read+captured.
+        skip: (row) => {
+          const s = slugify(row.title)
+          const outOfScope = includeSlugs.size > 0 && !includeSlugs.has(s)
+          return outOfScope || excluded.has(s) || (!row.unread && captured.has(s))
+        },
+        stopped: () => stopSweep.current,
+        onFound: (count) => report({ type: 'found', count }),
+        onOpening: (row) => report({ type: 'opening', title: row.title }),
+        onRead: (row) => report({ type: 'read', title: row.title })
+      })
+      opened = res.opened
+      const stopped = stopSweep.current
+      report({
+        type: 'end',
+        stopped,
+        note: stopped
+          ? 'Stopped before finishing'
+          : res.reachedEnd
+            ? 'Reached the end of the chat list'
+            : opened >= SWEEP_MAX
+              ? `Reached the ${SWEEP_MAX}-chat limit for one sweep`
+              : 'Stopped: chats stopped opening when clicked'
+      })
+    } catch (e) {
+      report({ type: 'end', stopped: true, note: `Stopped: ${e instanceof Error ? e.message : String(e)}` })
+    } finally {
+      sweepRunning.current = false
+    }
     Analytics.WhatsApp.scanned({ count: opened })
   }
 
