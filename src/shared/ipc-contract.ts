@@ -20,6 +20,33 @@ export interface NormalizedMessage {
   kind: 'text' | 'reply' | 'system' | 'reaction' | 'sticker' | 'media' | 'notification'
   isGroup?: boolean
   participants?: string[]
+  // The source, as WhatsApp knows it — what's needed to reopen this exact chat and reply to this
+  // exact message later. When the capture front-end doesn't report them, main recovers both from
+  // messageId (WhatsApp's own message key embeds the chat JID; see src/main/whatsapp/source.ts).
+  chatJid?: string // WhatsApp's chat id, e.g. '9198…@c.us' (1:1) or '1203…@g.us' (group)
+  senderJid?: string // the sender's WhatsApp id (a group member, or the 1:1 contact)
+}
+
+/**
+ * How well a stored message's source is known:
+ * - 'exact'      captured with its WhatsApp chat JID — reopens that exact chat and can quote the message
+ * - 'recovered'  stored before sources were kept; the chat JID was recovered from its message key
+ * - 'title-only' no chat JID (older capture or demo data) — reopened by the chat's display name only
+ */
+export type WaSourceStatus = 'exact' | 'recovered' | 'title-only'
+
+/** Where one stored message came from: enough to reopen its chat and reply to (quote) it. */
+export interface WaMessageSource {
+  conversationId: string // the app's key for the chat
+  chatTitle: string // the chat's display name (what WhatsApp's chat list shows)
+  chatJid: string | null // WhatsApp's own chat id; null when status is 'title-only'
+  messageId: string // WhatsApp's message key (the row's data-id)
+  sender: string | null // display name / number ('me' for the user's own)
+  senderJid: string | null
+  direction: 'incoming' | 'outgoing'
+  text: string
+  timestamp: number
+  status: WaSourceStatus
 }
 
 /** The obligation taxonomy extracted from a conversation window. */
@@ -64,6 +91,7 @@ export interface WaMessageView {
   text: string
   kind: string
   timestamp: number
+  source: WaMessageSource
 }
 
 /** One consolidated action inside a topic. */
@@ -72,6 +100,12 @@ export interface WhatsappTopicAction {
   owner?: string
   due?: string | null
   type: WhatsappItemType
+  evidence_message_ids?: string[] // the messages this action is drawn from (provenance)
+}
+
+/** A topic action as shown: its evidence resolved to the exact chat + message each id came from. */
+export interface WaTopicActionView extends WhatsappTopicAction {
+  evidence: WaMessageSource[]
 }
 
 /** A topic digest produced by extraction: a whole matter, not a single exchange. */
@@ -94,6 +128,7 @@ export interface WaTopicMessage {
   text: string
   timestamp: number
   pinned: boolean // user moved it here → re-extraction won't move it
+  source: WaMessageSource
 }
 
 /** A stored topic for the Topics view: digest + its assigned message bits. */
@@ -106,7 +141,7 @@ export interface WaTopicView {
   status: string
   priority: string
   tags: string[]
-  action_items: WhatsappTopicAction[]
+  action_items: WaTopicActionView[]
   messages: WaTopicMessage[]
   updated_at: number
 }
@@ -123,6 +158,56 @@ export interface WaActivityView {
   msgCount: number
   senders: string[] // sample names
   lastTs: number
+}
+
+/**
+ * Live progress of a chat sweep ("Read my chats"), kept by main and pushed on whatsapp:sweepProgress.
+ * The renderer drives the sweep (it owns the <webview>) and reports each step; main counts the
+ * messages actually captured, so the numbers come from the store, not the page.
+ */
+export interface WaSweepProgress {
+  state: 'idle' | 'running' | 'finished' | 'stopped'
+  chatsRead: number // chats opened and read so far
+  chatsTotal: number | null // chats this sweep will read, once known; null while still discovering
+  chatsFound: number // chats found to read so far (the denominator while the total isn't known)
+  messagesSeen: number // messages captured during the sweep (new + already stored)
+  messagesNew: number // of those, newly stored
+  current: string | null // the chat being read right now
+  currentMessages: number // messages captured from the current chat
+  startedAt: number | null
+  endedAt: number | null
+  note: string | null // why it stopped, or a finishing remark
+}
+
+/** A step of the sweep, reported by the renderer. */
+export type WaSweepEvent =
+  | { type: 'start'; limit: number }
+  | { type: 'found'; count: number; total?: number } // chats found to read so far (+ the total once known)
+  | { type: 'opening'; title: string }
+  | { type: 'read'; title: string }
+  | { type: 'end'; stopped: boolean; note?: string }
+
+/** What to reply to: a chat, and optionally the exact message to quote. */
+export interface WaReplyTarget {
+  conversationId: string
+  messageId?: string
+}
+
+/** A reply ready to stage: where it goes, what it quotes, and the drafted text. Never sent by the app. */
+export interface WaReplyPlan {
+  conversationId: string
+  chatTitle: string
+  chatJid: string | null
+  quote: WaMessageSource | null // the message to quote (null = reply to the chat)
+  draft: string
+}
+
+/** The outcome of staging a reply in WhatsApp Web. Staging never sends. */
+export interface WaReplyStaged {
+  opened: boolean // the exact chat is open
+  quoted: boolean // WhatsApp's reply-quote of the message is attached
+  staged: boolean // the draft is in the message box, waiting for the user's Send
+  note?: string // what didn't work, in plain words
 }
 
 /** The WhatsApp Web session state, surfaced on the connector card. */
@@ -148,11 +233,19 @@ export interface IpcInvokeChannels {
   'wa:setExcluded': { args: [id: string, excluded: boolean]; return: { ok: boolean } }
   'wa:clearAll': { args: []; return: { ok: boolean } }
   'wa:draftReply': { args: [conversationId: string]; return: { ok: boolean; draft?: string; error?: string } }
+  // Reply to a specific message (or an action item's evidence): resolves its exact chat + message
+  // from the stored source and drafts a reply to it. The renderer then STAGES it in WhatsApp Web —
+  // opens that chat, quotes that message, puts the draft in the box. Never sends.
+  'wa:prepareReply': { args: [target: WaReplyTarget]; return: { ok: boolean; plan?: WaReplyPlan; error?: string } }
   // Live embedded WhatsApp Web. The renderer mounts the <webview> from this config; the
   // injected DOM detector streams captured messages via wa:ingest and reports the session's
   // auth state (qr → linked) via wa:reportSession. Nothing here sends a message.
   'wa:webviewConfig': { args: []; return: WaWebviewConfig }
   'wa:ingest': { args: [message: NormalizedMessage]; return: { ok: boolean } }
+  // Chat sweep progress: the renderer reports each step; main keeps the counts (messages come from
+  // what ingest actually stored) and pushes them on whatsapp:sweepProgress.
+  'wa:sweepEvent': { args: [event: WaSweepEvent]; return: WaSweepProgress }
+  'wa:sweepProgress': { args: []; return: WaSweepProgress }
   // A captured voice note. The base64 audio is transcribed via Sarvam in main, and the
   // transcript is ingested as the message text (kind 'voice') → topic extraction reads it.
   'wa:transcribeAudio': {
@@ -218,6 +311,7 @@ export interface IpcEventChannels {
   'whatsapp:messagesChanged': Record<string, never>
   'whatsapp:sessionState': { state: WaSessionState }
   'whatsapp:topicsChanged': Record<string, never>
+  'whatsapp:sweepProgress': WaSweepProgress
 }
 
 export type InvokeChannel = keyof IpcInvokeChannels
@@ -231,8 +325,11 @@ export const INVOKE_CHANNELS = [
   'wa:setExcluded',
   'wa:clearAll',
   'wa:draftReply',
+  'wa:prepareReply',
   'wa:webviewConfig',
   'wa:ingest',
+  'wa:sweepEvent',
+  'wa:sweepProgress',
   'wa:transcribeAudio',
   'wa:expectMediaDownload',
   'wa:describeImage',
@@ -258,5 +355,6 @@ export const INVOKE_CHANNELS = [
 export const EVENT_CHANNELS = [
   'whatsapp:messagesChanged',
   'whatsapp:sessionState',
-  'whatsapp:topicsChanged'
+  'whatsapp:topicsChanged',
+  'whatsapp:sweepProgress'
 ] as const

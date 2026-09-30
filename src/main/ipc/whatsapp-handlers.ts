@@ -1,8 +1,10 @@
 import { ipcMain, BrowserWindow } from 'electron'
 import { getDb } from '../db'
 import { listConversations, getConversation, setExcluded, clearWhatsapp } from '../whatsapp/store'
+import { resolveReplyTarget } from '../whatsapp/reply'
 import { draftReply } from '../whatsapp/draft'
-import { ingestMessage, runAnalysisBatch } from '../whatsapp/observer'
+import { ingestMessage, runAnalysisBatch, sweepProgress } from '../whatsapp/observer'
+import { coerceMessage } from '../whatsapp/source'
 import { listActivity } from '../whatsapp/activity'
 import { sessionState, webviewConfig, reportSession, setDemo, expectMediaDownload, MOCK_CONVERSATION_IDS } from '../whatsapp/session'
 import { transcribeAndIngest } from '../whatsapp/voice'
@@ -12,7 +14,7 @@ import { healRecipe } from '../whatsapp/heal'
 import { getSelectors, healSelectors, resetSelectors, type SelectorKey } from '../whatsapp/selectors'
 import { getIncludeList, setIncludeList, includedSlugs } from '../whatsapp/scope'
 import { listTopics, moveMessage, clearTopics, setTopicPriority, setTopicTags } from '../whatsapp/topics-store'
-import type { NormalizedMessage, WaSessionState } from '../../shared/ipc-contract'
+import type { WaReplyTarget, WaSessionState, WaSweepEvent } from '../../shared/ipc-contract'
 
 // WhatsApp IPC surface. Read-oriented: list/read chats, toggle per-chat exclusions, delete all
 // indexed data, and STAGE a draft reply (never sends). The renderer never touches a cloud API
@@ -51,8 +53,29 @@ export function registerWhatsappHandlers(): void {
     }
   })
 
+  // Reply to one exact message (or just the chat): resolve where it lives from the stored source and
+  // draft a reply to it. The renderer stages the plan in WhatsApp Web; nothing is ever sent from here.
+  ipcMain.handle('wa:prepareReply', async (_e, target: WaReplyTarget) => {
+    try {
+      const db = getDb()
+      const r = resolveReplyTarget(db, target)
+      if (!r.ok) return { ok: false as const, error: r.error }
+      const { draft } = await draftReply(db, r.dest.conversationId, r.dest.quote)
+      return { ok: true as const, plan: { ...r.dest, draft } }
+    } catch (err) {
+      return { ok: false as const, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
   // ── Live embedded WhatsApp Web ──────────────────────────────────────────────────
   ipcMain.handle('wa:webviewConfig', () => webviewConfig())
+
+  // Chat-sweep progress: the renderer reports each step; main owns the counts (see progress.ts).
+  ipcMain.handle('wa:sweepEvent', (_e, raw: unknown) => {
+    const ev = coerceSweepEvent(raw)
+    return ev ? sweepProgress.event(ev) : sweepProgress.snapshot()
+  })
+  ipcMain.handle('wa:sweepProgress', () => sweepProgress.snapshot())
 
   // The DOM detector (running in the WhatsApp <webview>) streams captured messages here. This
   // payload is UNTRUSTED page-derived data — validate/coerce it into a NormalizedMessage before
@@ -226,34 +249,25 @@ function clearMockData(): void {
   })()
 }
 
-const KINDS = new Set(['text', 'reply', 'system', 'reaction', 'sticker', 'media', 'notification'])
-
-/** Harden the page-derived message: strict types, bounded text, sane fields — never trust the DOM. */
-function coerceMessage(raw: unknown): NormalizedMessage | null {
+/** A renderer-reported sweep step, strictly typed (the renderer is trusted, but keep main's state sane). */
+function coerceSweepEvent(raw: unknown): WaSweepEvent | null {
   if (!raw || typeof raw !== 'object') return null
   const r = raw as Record<string, unknown>
-  const str = (v: unknown, max = 4000): string => (typeof v === 'string' ? v.slice(0, max) : '')
-  const conversationId = str(r.conversationId, 300)
-  const messageId = str(r.messageId, 300)
-  const text = str(r.text)
-  if (!conversationId || !messageId) return null
-  const direction = r.direction === 'outgoing' ? 'outgoing' : 'incoming'
-  const kind = KINDS.has(r.kind as string) ? (r.kind as NormalizedMessage['kind']) : 'text'
-  const ts = typeof r.timestamp === 'number' && isFinite(r.timestamp) ? r.timestamp : Date.now()
-  const participants = Array.isArray(r.participants)
-    ? (r.participants as unknown[]).filter((p): p is string => typeof p === 'string').slice(0, 256).map((p) => p.slice(0, 200))
-    : undefined
-  return {
-    conversationId,
-    conversationTitle: str(r.conversationTitle, 300) || conversationId,
-    messageId,
-    from: str(r.from, 200) || (direction === 'outgoing' ? 'me' : 'unknown'),
-    direction,
-    text,
-    timestamp: ts,
-    kind,
-    isGroup: !!r.isGroup,
-    participants
+  const num = (v: unknown): number => (typeof v === 'number' && isFinite(v) ? v : 0)
+  const str = (v: unknown): string => (typeof v === 'string' ? v.slice(0, 300) : '')
+  switch (r.type) {
+    case 'start':
+      return { type: 'start', limit: num(r.limit) }
+    case 'found':
+      return { type: 'found', count: num(r.count), ...(typeof r.total === 'number' ? { total: num(r.total) } : {}) }
+    case 'opening':
+      return { type: 'opening', title: str(r.title) }
+    case 'read':
+      return { type: 'read', title: str(r.title) }
+    case 'end':
+      return { type: 'end', stopped: !!r.stopped, ...(r.note ? { note: str(r.note) } : {}) }
+    default:
+      return null
   }
 }
 
@@ -265,8 +279,11 @@ export function cleanupWhatsappHandlers(): void {
     'wa:setExcluded',
     'wa:clearAll',
     'wa:draftReply',
+    'wa:prepareReply',
     'wa:webviewConfig',
     'wa:ingest',
+    'wa:sweepEvent',
+    'wa:sweepProgress',
     'wa:transcribeAudio',
     'wa:expectMediaDownload',
     'wa:describeImage',

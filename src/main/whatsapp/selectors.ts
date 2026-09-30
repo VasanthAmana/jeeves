@@ -1,5 +1,6 @@
 import { getSetting, setSetting } from '../db/settings'
 import { completeJSON } from '../llm/complete'
+import { DEFAULT_SELECTORS, type SelectorKey } from './selector-defaults'
 
 // Healable ACTION selectors (WAC-019 extended to the write/media path). The injected read-recipe
 // already self-heals when it captures nothing; but the renderer-driven actions — open a chat,
@@ -8,26 +9,7 @@ import { completeJSON } from '../llm/complete'
 // only diagnostic and an AI pass rewrites the failing selector(s). Same safety model as heal.ts:
 // AI only ever returns CSS selector strings (never code), validated before they're persisted.
 
-export type SelectorKey =
-  | 'chatRow' // a row in the chat list (has a title span)
-  | 'chatRowTitle' // the title element within a chat row
-  | 'header' // the open chat's header (first line = chat name)
-  | 'composer' // the message input box (contenteditable)
-  | 'sendButton' // the Send button (visible once the composer has text)
-  | 'mentionOption' // an option in the @mention autocomplete popup
-  | 'voicePlay' // the play control of a voice-note message
-  | 'imageBlob' // a photo's blob-backed <img>
-
-export const DEFAULT_SELECTORS: Record<SelectorKey, string> = {
-  chatRow: '#pane-side [role="row"]',
-  chatRowTitle: 'span[title]',
-  header: '#main header',
-  composer: '#main footer div[contenteditable="true"], #main footer [role="textbox"]',
-  sendButton: '#main footer [data-icon="send"], #main footer button[aria-label*="Send" i], #main footer span[data-icon="send"]',
-  mentionOption: '#main [role="listbox"] [role="option"], #main [role="option"]',
-  voicePlay: 'button[aria-label*="Play voice" i], [data-icon="ptt-status"]',
-  imageBlob: 'img[src^="blob:"]'
-}
+export { DEFAULT_SELECTORS, type SelectorKey } from './selector-defaults'
 
 // One-line description per key so the heal prompt knows what each selector must match.
 const DESCRIPTIONS: Record<SelectorKey, string> = {
@@ -38,7 +20,8 @@ const DESCRIPTIONS: Record<SelectorKey, string> = {
   sendButton: 'the button that sends the typed message (appears once the box has text)',
   mentionOption: 'a selectable person option in the @mention autocomplete popup',
   voicePlay: 'the play button of a voice-note (PTT) message',
-  imageBlob: 'the thumbnail image element of a photo message (a blob-backed <img>)'
+  imageBlob: 'the thumbnail image element of a photo message (a blob-backed <img>)',
+  chatSearch: 'the search box above the chat list ("Search or start a new chat")'
 }
 
 const SETTING = 'wa_action_selectors'

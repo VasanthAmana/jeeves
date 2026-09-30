@@ -1,7 +1,5 @@
-// Local SQLite schema — operational state only. Secrets are safeStorage-encrypted
-// blobs (see ../secrets/keychain.ts), never plaintext.
-
-export const SCHEMA_SQL = `
+-- The database schema as shipped before message sources were kept (commit 3a6f099), for the
+-- migration tests: a database created by that build must open, migrate, and stay readable.
 -- Non-secret app-level settings (key/value): the demo toggle, the inclusion allow-list, the
 -- extraction recipe + its self-heal history, healed action selectors. Secrets NEVER go here.
 CREATE TABLE IF NOT EXISTS app_settings (
@@ -27,8 +25,7 @@ CREATE TABLE IF NOT EXISTS wa_conversations (
   participants TEXT NOT NULL DEFAULT '[]',        -- JSON string[]
   excluded     INTEGER NOT NULL DEFAULT 0,        -- 1 = never analyse / never send to cloud
   last_seen_at INTEGER,
-  created_at   INTEGER NOT NULL,
-  chat_jid     TEXT                               -- WhatsApp's own chat id (latest seen); NULL if never reported
+  created_at   INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS wa_messages (
@@ -44,11 +41,6 @@ CREATE TABLE IF NOT EXISTS wa_messages (
   topic_pinned    INTEGER NOT NULL DEFAULT 0,      -- a user MOVED it here; re-extraction won't override
   analysis_class  TEXT NOT NULL DEFAULT 'topic',   -- 'topic' (substantive) | 'ritual' (greeting/wish)
   created_at      INTEGER NOT NULL,
-  -- The source, for finding + replying to this message later (see whatsapp/source.ts). Added by
-  -- migration 1 (migrate.ts) — keep the two in step.
-  chat_jid        TEXT,                            -- WhatsApp chat id this message was captured in
-  sender_jid      TEXT,                            -- sender's WhatsApp id (NULL for the user's own)
-  source_status   TEXT NOT NULL DEFAULT 'title-only', -- exact | recovered | title-only (WaSourceStatus)
   UNIQUE(conversation_id, message_id)
 );
 
@@ -97,4 +89,3 @@ CREATE TABLE IF NOT EXISTS wa_activity (
 );
 
 CREATE INDEX IF NOT EXISTS idx_wa_activity_conv ON wa_activity(conversation_id, last_ts);
-`

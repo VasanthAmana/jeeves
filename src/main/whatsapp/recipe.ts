@@ -8,7 +8,9 @@ import { getSetting, setSetting } from '../db/settings'
 //
 // The recipe reports over console.log (the one-way bridge, no preload):
 //   __WA_MSG__<json>     one captured message {conversationId,conversationTitle,messageId,from,
-//                        direction:'incoming'|'outgoing',text,timestamp,kind,isGroup}
+//                        direction:'incoming'|'outgoing',text,timestamp,kind,isGroup,chatJid?}
+//                        messageId is WhatsApp's own message key (the row's data-id), which embeds
+//                        the chat JID — main recovers the source from it when chatJid is absent.
 //   __WA_STATE__<state>  'linked' | 'qr' | 'unauthenticated'
 //   __WA_HEALTH__<json>  {linked, domMsgs, captured, storeChats} — lets the app detect "page has
 //                        messages but we captured 0" = broken → trigger AI-heal
@@ -28,7 +30,7 @@ const RECIPE_BASE_SETTING = 'wa_recipe_base'
 // self-heal is only reused when it was derived from the CURRENT code base — otherwise a heal from
 // an older build would shadow the newly-shipped default forever (this is exactly what hid the image
 // branch during testing). On mismatch we fall back to DEFAULT_RECIPE, which re-heals if it breaks.
-const RECIPE_CODE_VERSION = '2-media'
+const RECIPE_CODE_VERSION = '3-source'
 
 export const DEFAULT_RECIPE = String.raw`(() => {
   if (window.__waCopilot) return; window.__waCopilot = true;
@@ -118,7 +120,7 @@ export const DEFAULT_RECIPE = String.raw`(() => {
           var sender = fromMe ? 'me' : ((m.senderObj && (m.senderObj.formattedName || m.senderObj.pushname)) || (m.author && String(m.author)) || title);
           var ts = (m.t ? m.t * 1000 : Date.now());
           seen.add(mid);
-          out({ conversationId: convId, conversationTitle: title, messageId: String(mid), from: fromMe ? 'me' : String(sender), direction: fromMe ? 'outgoing' : 'incoming', text: String(body), timestamp: ts, kind: 'text', isGroup: isGroup });
+          out({ conversationId: convId, conversationTitle: title, messageId: String(mid), from: fromMe ? 'me' : String(sender), direction: fromMe ? 'outgoing' : 'incoming', text: String(body), timestamp: ts, kind: 'text', isGroup: isGroup, chatJid: jid });
         }
       }
     } catch (e) {}

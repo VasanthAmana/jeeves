@@ -1,4 +1,5 @@
 import { getSetting, setSetting } from '../db/settings'
+import { slugifyTitle } from './source'
 
 // Analysis scope (WAC-015 extension) — an INCLUSION allow-list. When set, ONLY the listed chats
 // are ingested/analysed and everything else is dropped at the boundary; when empty, all chats are
@@ -8,13 +9,7 @@ import { getSetting, setSetting } from '../db/settings'
 
 const INCLUDE_SETTING = 'wa_include'
 
-export function slugifyTitle(t: string): string {
-  return (t || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 60) || 'chat'
-}
+export { slugifyTitle }
 
 /** The inclusion allow-list of chat titles. Empty ⇒ analyse ALL chats. */
 export function getIncludeList(): string[] {

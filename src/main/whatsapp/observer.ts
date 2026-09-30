@@ -9,6 +9,8 @@ import { extractWhatsappTopics } from './analysis'
 import { existingTopics, pinnedAssignments, upsertTopic } from './topics-store'
 import { collapseActivity } from './activity'
 import { isIncluded } from './scope'
+import { SweepTracker } from './progress'
+import { slugifyTitle } from './source'
 import type { NormalizedMessage } from '../../shared/ipc-contract'
 
 // WhatsApp observation pipeline (WAC-004 / WAC-009-topics). On each captured message we: (1)
@@ -24,9 +26,13 @@ export const whatsappObservations = new EventEmitter()
 const EXTRACT_DEBOUNCE_MS = 2500
 const pending = new Map<string, NodeJS.Timeout>()
 
-function broadcast(channel: string): void {
-  for (const w of BrowserWindow.getAllWindows()) w.webContents.send(channel, {})
+function broadcast(channel: string, payload: object = {}): void {
+  for (const w of BrowserWindow.getAllWindows()) w.webContents.send(channel, payload)
 }
+
+// Chat-sweep progress: the renderer reports sweep steps (wa:sweepEvent); every message ingest stores
+// while a sweep runs is counted here, and the snapshot is pushed on whatsapp:sweepProgress.
+export const sweepProgress = new SweepTracker((p) => broadcast('whatsapp:sweepProgress', p), slugifyTitle)
 
 /** Ingest one captured message: persist it and (unless excluded/noise) schedule extraction. */
 export function ingestMessage(msg: NormalizedMessage): void {
@@ -38,6 +44,7 @@ export function ingestMessage(msg: NormalizedMessage): void {
   const now = Date.now()
   const excluded = upsertConversation(db, msg, now)
   const isNew = insertMessage(db, msg, now)
+  sweepProgress.message(msg, isNew)
   broadcast('whatsapp:messagesChanged')
 
   // WAC-015: an excluded chat is stored (so the exclude toggle can show it) but never analysed.

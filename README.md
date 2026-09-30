@@ -21,6 +21,15 @@ automation are designed to repair themselves when it changes, rather than silent
   "thanks" — into one frequency-counted line per chat instead of letting them pollute topics.
 - **Drafts replies** on request. A draft is staged for you to read, edit, copy, or discard; it
   is never sent automatically.
+- **Replies to the exact message**: every captured message keeps its source — WhatsApp's own
+  chat id and message key, plus the sender — so from a topic's message or action item, **Reply**
+  reopens that exact chat, quotes that exact message (WhatsApp's own reply-quote) and puts a draft
+  in the message box. You press Send; the app never does. Messages captured before sources were
+  kept are recovered from their stored message key where possible, else marked "no source" and
+  reopened by chat name.
+- **Shows read progress**: while "Read my chats" runs, the banner shows chats read of the total
+  (or found so far), messages captured (and how many were new), and the chat being read — then a
+  finished or stopped summary with the final counts. There's a Stop button.
 - **Assigns a task back into WhatsApp**: posts one line into a group with a real `@mention`
   (not plain "@name" text, which notifies nobody) — always behind an explicit preview + confirm.
 - **Transcribes voice notes and describes images** (opt-in, needs a model backend and, for

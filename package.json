@@ -9,7 +9,7 @@
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "lint": "eslint .",
-    "test": "node --test \"test/**/*.test.ts\"",
+    "test": "node --import ./test/support/register.mjs --test \"test/**/*.test.ts\"",
     "format": "prettier --write .",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
