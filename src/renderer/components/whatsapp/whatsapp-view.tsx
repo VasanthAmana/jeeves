@@ -7,6 +7,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { TopicsView } from './topics-view'
 import { registerWaSender, type WaTaskSend } from './wa-sender'
 import { createGuest, type Guest } from './guest'
+import { sweepChats } from './sweep'
 import * as gs from './guest-scripts'
 import type { NormalizedMessage, WaConversationView, WaMessageView, WaSessionState, WaWebviewConfig } from '@shared/ipc-contract'
 
@@ -228,7 +229,8 @@ export function WhatsAppView(): React.JSX.Element {
 // appears here to link a phone, and stays linked across restarts. On dom-ready we inject the
 // read-only DOM detector; its captured messages arrive as console messages, which we validate
 // in main via wa:ingest. Nothing here ever sends a message.
-// The sweep clicks each VISIBLE chat row to open it, letting the detector read it. Capped +
+// The sweep walks the chat list (scrolling as each screen is used up) and clicks rows to open them,
+// letting the detector read each one (see sweep.ts). Capped +
 // opt-in because opening a chat marks it read and sends a read receipt (a real side effect).
 const SWEEP_MAX = 12
 const SWEEP_DELAY_MS = 1700
@@ -601,19 +603,12 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
     const excluded = new Set(known.filter((c) => c.excluded).map((c) => c.id))
     const captured = new Set(known.map((c) => c.id)) // chats already in our store
 
-    // Re-read the CURRENTLY-visible chat rows each step (fresh coords + fresh unread state — the
-    // list re-renders as chats open). Coords are guest-viewport px = webview px.
-    type Row = gs.ChatRow
-    const visibleRows = async (): Promise<Row[]> => {
-      const r = await g.run('visibleChatRows', gs.visibleChatRows)
+    // Guest reads use the healable selectors (an action heal of chatRow/header fixes the sweep too).
+    // Rows are re-read every step (fresh coords + unread state — the list re-renders as chats open
+    // and as it scrolls). Coords are guest-viewport px = webview px.
+    const visibleRows = async (): Promise<gs.ChatRow[]> => {
+      const r = await g.run('visibleChatRows', gs.visibleChatRows, sels.current.chatRow, sels.current.chatRowTitle)
       return r.ok ? r.value : []
-    }
-    const openHeader = async (): Promise<string> => {
-      const r = await g.run('headerTitle', gs.headerTitle, '#main header')
-      return r.ok ? r.value : ''
-    }
-    const scrollDown = async (): Promise<void> => {
-      await g.run('scrollChatList', gs.scrollChatList)
     }
     // Real click: move → down → up. WhatsApp ignores synthetic clicks; sendInputEvent is trusted.
     const clickAt = (x: number, y: number): void => {
@@ -623,43 +618,33 @@ function LiveWhatsAppPane({ cfg }: { cfg: WaWebviewConfig }): React.JSX.Element 
     }
     // Human-like jitter so the pacing doesn't look like rapid-fire automation (lower ban signal).
     const jitter = (base: number): number => base + Math.floor(Math.random() * 500)
+    const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
-    const decided = new Set<string>() // titles we've opened OR deliberately skipped
-    let opened = 0
-    let stagnant = 0
-    let prevHeader = await openHeader()
     setSweep({ running: true, done: 0, total: SWEEP_MAX })
-    while (opened < SWEEP_MAX && stagnant < 5) {
-      const rows = (await visibleRows()).filter((r) => r.title && !decided.has(r.title))
-      // Skip (mark decided, don't open): out-of-scope (allow-list), excluded, and read+captured.
-      for (const r of rows) {
-        const s = slugify(r.title)
+    const { opened } = await sweepChats({
+      maxOpens: SWEEP_MAX,
+      visibleRows,
+      scroll: async () => {
+        const r = await g.run('scrollChatList', gs.scrollChatList, sels.current.chatRow)
+        return r.ok && r.value.moved
+      },
+      settle: () => sleep(jitter(400)),
+      open: async (row) => {
+        clickAt(row.x, row.y)
+        await sleep(jitter(SWEEP_DELAY_MS)) // let it open + the detector read it
+      },
+      header: async () => {
+        const r = await g.run('headerTitle', gs.headerTitle, sels.current.header)
+        return r.ok ? r.value : ''
+      },
+      // Skip (never open): out-of-scope (allow-list), excluded, and read+captured.
+      skip: (row) => {
+        const s = slugify(row.title)
         const outOfScope = includeSlugs.size > 0 && !includeSlugs.has(s)
-        if (outOfScope || excluded.has(s) || (!r.unread && captured.has(s))) decided.add(r.title)
-      }
-      const candidates = rows.filter((r) => !decided.has(r.title))
-      // Priority: unread first (new content / obligations), then never-captured chats (backfill).
-      candidates.sort((a, b) => (b.unread ? 1 : 0) - (a.unread ? 1 : 0))
-      const next = candidates[0]
-      if (!next) {
-        await scrollDown()
-        await new Promise((r) => setTimeout(r, jitter(400)))
-        stagnant++
-        continue
-      }
-      decided.add(next.title)
-      setSweep({ running: true, done: opened, total: SWEEP_MAX, current: (next.unread ? '🔵 ' : '') + next.title })
-      clickAt(next.x, next.y)
-      await new Promise((r) => setTimeout(r, jitter(SWEEP_DELAY_MS))) // let it open + the detector read it
-      const hdr = await openHeader()
-      if (hdr && hdr !== prevHeader) {
-        opened++
-        prevHeader = hdr
-        stagnant = 0
-      } else {
-        stagnant++ // click didn't open a new chat — try the next candidate
-      }
-    }
+        return outOfScope || excluded.has(s) || (!row.unread && captured.has(s))
+      },
+      onOpening: (row, done) => setSweep({ running: true, done, total: SWEEP_MAX, current: (row.unread ? '🔵 ' : '') + row.title })
+    })
     setSweep({ running: false, done: opened, total: opened })
     Analytics.WhatsApp.scanned({ count: opened })
   }

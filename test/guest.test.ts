@@ -23,7 +23,8 @@ function guestContext(els: Els = {}): vm.Context {
     execCommand: () => true
   }
   const window: Record<string, unknown> = { innerHeight: 800 }
-  const ctx = vm.createContext({ document, window, getSelection: () => null })
+  const getComputedStyle = (el: { style?: { overflowY?: string } }) => ({ overflowY: el.style?.overflowY ?? 'visible' })
+  const ctx = vm.createContext({ document, window, getSelection: () => null, getComputedStyle })
   window.document = document
   return ctx
 }
@@ -57,7 +58,9 @@ test('every guest script is self-contained and survives a page with none of its 
     caretToComposerEnd: ['footer [contenteditable]'],
     mentionOptionPoint: ['[role="option"]', 'Bob'],
     sendButtonPoint: ['footer [contenteditable]', '[data-icon="send"]'],
-    composerText: ['footer [contenteditable]']
+    composerText: ['footer [contenteditable]'],
+    visibleChatRows: ['#pane-side [role="row"]', 'span[title]'],
+    scrollChatList: ['#pane-side [role="row"]']
   }
   for (const [name, fn] of scripts) {
     const r = await runInGuest(guestScript(fn, (args[name] ?? []) as never[]))
@@ -125,4 +128,63 @@ test('the runner skips calls until the page is ready, and logs guest + transport
   reject = false
   assert.equal((await g.runData('recipe', 'throw new Error("recipe broke")')).ok, false)
   assert.match(logs.at(-1) ?? '', /\[wa-guest\] recipe: guest error: .*recipe broke/)
+})
+
+/** A box with WhatsApp's scroll geometry; only one that has overflowY auto/scroll can scroll. */
+function box(clientHeight: number, scrollHeight: number, overflowY: string, parentElement: unknown = null) {
+  return {
+    clientHeight,
+    scrollHeight,
+    style: { overflowY },
+    parentElement,
+    _top: 0,
+    get scrollTop() {
+      return this._top
+    },
+    set scrollTop(v: number) {
+      this._top = Math.max(0, Math.min(v, this.scrollHeight - this.clientHeight))
+    }
+  }
+}
+
+test('the chat list scrolls the element that actually scrolls, not the tall virtualised grid', async () => {
+  // WhatsApp: #pane-side (overflow auto, 700px tall) > wrapper > role=grid (40 rows × 72px, no
+  // overflow, so scrolling it does nothing) > row. The old script scrolled the grid; nothing moved.
+  const pane = box(700, 2880, 'auto')
+  const grid = box(2880, 2880, 'visible', box(2880, 2880, 'visible', pane))
+  const row = box(72, 72, 'visible', grid)
+  const ctx = guestContext({ '#pane-side [role="row"]': row, '#pane-side': pane })
+  const scroll = () => runInGuest(guestScript(gs.scrollChatList, ['#pane-side [role="row"]']), ctx)
+
+  assert.deepEqual(await scroll(), { ok: true, value: { moved: true } })
+  assert.equal(pane.scrollTop, 560)
+  assert.equal(grid.scrollTop, 0)
+  for (let i = 0; i < 20; i++) {
+    const r = await scroll()
+    if (!r.ok || !(r.value as { moved: boolean }).moved) break
+  }
+  assert.equal(pane.scrollTop, 2180) // reached the bottom of the list
+  assert.deepEqual(await scroll(), { ok: true, value: { moved: false } }) // and says so
+})
+
+test('rows count as on screen within the list container, including the last row at the window edge', async () => {
+  // #pane-side spans y=110..860 (the window bottom). Rows: one clipped under the list's top edge,
+  // two fully inside, and the list's LAST row ending exactly at the bottom edge — which the old
+  // `bottom < innerHeight - 8` rule excluded, so the sweep could never open the last chat.
+  const pane = { ...box(750, 2880, 'auto'), getBoundingClientRect: () => ({ top: 110, bottom: 860 }) }
+  const grid = box(2880, 2880, 'visible', pane)
+  const row = (title: string, top: number, unread = false) => ({
+    parentElement: grid,
+    getBoundingClientRect: () => ({ top, bottom: top + 72, height: 72, left: 0, width: 340 }),
+    querySelector: (sel: string) =>
+      sel === 'span[title]' ? { getAttribute: () => title, textContent: title } : sel.includes('unread') && unread ? {} : null,
+    getAttribute: () => ''
+  })
+  const rows = [row('Clipped', 80), row('A', 152, true), row('B', 224), row('Last', 788)]
+  const ctx = guestContext({ '#pane-side [role="row"]': rows })
+  ;(ctx.window as { innerHeight: number }).innerHeight = 860
+  const r = await runInGuest(guestScript(gs.visibleChatRows, ['#pane-side [role="row"]', 'span[title]']), ctx)
+  assert.equal(r.ok, true)
+  const got = (r as { value: { title: string; unread: boolean; y: number }[] }).value
+  assert.deepEqual(got.map((x) => [x.title, x.unread, x.y]), [['A', true, 188], ['B', false, 260], ['Last', false, 824]])
 })

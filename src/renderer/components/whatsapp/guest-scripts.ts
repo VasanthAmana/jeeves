@@ -158,25 +158,51 @@ export function composerText(composerSel: string): string | null {
 
 export type ChatRow = { title: string; x: number; y: number; unread: boolean }
 
-/** The chat-list rows currently fully on screen (fresh coords + unread state for the sweep). */
-export function visibleChatRows(): ChatRow[] {
-  const rows = Array.from(document.querySelectorAll('#pane-side [role="row"]'))
+/**
+ * The chat-list rows currently fully on screen (fresh coords + unread state for the sweep). "On
+ * screen" = inside the list's scrolling container (and the window), so the last row of a list that
+ * runs to the bottom edge still counts once it's scrolled into view.
+ */
+export function visibleChatRows(rowSel: string, titleSel: string): ChatRow[] {
+  const rows = Array.from(document.querySelectorAll(rowSel))
+  const scrolls = (el: Element): boolean => {
+    const oy = getComputedStyle(el).overflowY
+    return el.scrollHeight > el.clientHeight + 1 && (oy === 'auto' || oy === 'scroll' || oy === 'overlay')
+  }
+  let sc: Element | null = rows[0] ? rows[0].parentElement : null
+  while (sc && !scrolls(sc)) sc = sc.parentElement
+  const vb = sc ? sc.getBoundingClientRect() : { top: 0, bottom: window.innerHeight }
+  const top = Math.max(0, vb.top)
+  const bottom = Math.min(window.innerHeight, vb.bottom)
   const out: ChatRow[] = []
   for (const r of rows) {
     const b = r.getBoundingClientRect()
-    const t = (r.querySelector<HTMLElement>('span[title]') || { title: '' }).title || ''
+    const te = r.querySelector(titleSel)
+    const t = te ? (te.getAttribute('title') || te.textContent || '').trim() : ''
     const unread = !!r.querySelector('[aria-label*="unread" i]') || /\b\d+\s*unread\b/i.test(r.getAttribute('aria-label') || '')
-    if (t && b.top > 64 && b.bottom < window.innerHeight - 8 && b.width > 120) {
+    if (t && b.top >= top - 1 && b.bottom <= bottom + 1 && b.width > 120) {
       out.push({ title: t, x: Math.round(b.left + b.width / 2), y: Math.round(b.top + b.height / 2), unread })
     }
   }
   return out
 }
 
-/** Scroll the chat list down one step (to reveal more rows for the sweep). */
-export function scrollChatList(): void {
-  const p = document.querySelector('#pane-side')
-  if (!p) return
-  const g = p.querySelector('[role="grid"]') || p
-  g.scrollBy(0, 320)
+/**
+ * Scroll the chat list down about one screen, to reveal (and make WhatsApp render) more rows.
+ * WhatsApp's list is virtualised: the role=grid is a tall box that does NOT scroll itself — an
+ * ancestor (today #pane-side) does — so walk up from a row to whichever element actually scrolls
+ * rather than trusting a fixed selector. `moved: false` = already at the end of the list.
+ */
+export function scrollChatList(rowSel: string): { moved: boolean } {
+  const scrolls = (el: Element): boolean => {
+    const oy = getComputedStyle(el).overflowY
+    return el.scrollHeight > el.clientHeight + 1 && (oy === 'auto' || oy === 'scroll' || oy === 'overlay')
+  }
+  let el: Element | null = document.querySelector(rowSel) || document.querySelector('#pane-side')
+  while (el && !scrolls(el)) el = el.parentElement
+  const sc = el || document.querySelector('#pane-side')
+  if (!sc) return { moved: false }
+  const before = sc.scrollTop
+  sc.scrollTop = before + Math.max(200, Math.round(sc.clientHeight * 0.8))
+  return { moved: sc.scrollTop > before }
 }
